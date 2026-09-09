@@ -4,7 +4,7 @@ LNURLcash ([LUD-25 draft](https://github.com/lnurl/luds/pull/301)) bearer notes
 for Go: mint, rotate, split, merge, melt, and verify a note offline.
 
 ```bash
-go get github.com/TheCryptoDonkey/lnurlcash-go
+go get github.com/lnurlcash/lnurlcash-go
 ```
 
 Early `0.x`, tracking a **draft** spec. Pin an exact version.
@@ -209,7 +209,7 @@ go test ./...    # needs node and the conformance repo alongside
 ```
 
 Tested against
-[lnurlcash-conformance](https://github.com/TheCryptoDonkey/lnurlcash-conformance):
+[lnurlcash-conformance](https://github.com/lnurlcash/lnurlcash-conformance):
 the same vectors as the TypeScript, Python, Rust and Kotlin implementations,
 plus a mock mint that can be told to drop a connection mid-mutation, sign in
 the wrong byte order, lie about a note's value, or never settle a melt.
@@ -220,7 +220,7 @@ Both by dni, both MIT: [lnurl-mint](https://github.com/dni/lnurl-mint) and
 [lnurl-wallet](https://github.com/dni/lnurl-wallet).
 
 The wider ecosystem — wallets, mints, hardware and the sibling ports — is
-indexed in [awesome-lnurlcash](https://github.com/TheCryptoDonkey/awesome-lnurlcash).
+indexed in [awesome-lnurlcash](https://github.com/lnurlcash/awesome-lnurlcash).
 
 ## License
 

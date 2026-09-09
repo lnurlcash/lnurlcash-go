@@ -1,4 +1,4 @@
-module github.com/TheCryptoDonkey/lnurlcash-go
+module github.com/lnurlcash/lnurlcash-go
 
 go 1.25
 

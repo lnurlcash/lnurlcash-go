@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	lnurlcash "github.com/TheCryptoDonkey/lnurlcash-go"
+	lnurlcash "github.com/lnurlcash/lnurlcash-go"
 )
 
 type mockMint struct {

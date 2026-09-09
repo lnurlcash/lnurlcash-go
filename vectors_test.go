@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	lnurlcash "github.com/TheCryptoDonkey/lnurlcash-go"
+	lnurlcash "github.com/lnurlcash/lnurlcash-go"
 )
 
 func vectorsDir(t *testing.T) string {

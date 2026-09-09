@@ -5,6 +5,15 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### The import path is `github.com/lnurlcash/lnurlcash-go`
+
+The repository moved into the `lnurlcash` org. GitHub redirects the old path
+and `go get` follows it, so nothing was broken — but a module path is the one
+thing that cannot be corrected quietly once a version is tagged, because every
+importer has it written down. Fixed here, before the first tag, rather than
+becoming a rename nobody can undo.
+
+
 ### Three more fields off a mint address
 
 `ParseMintAddress` reads `nodeUris`, `sunsetDate` and `outstandingNotesMsat`,
@@ -42,7 +51,7 @@ which the reference mint publishes and this dropped.
 First release. A Go implementation of LNURLcash, following the protocol layer
 of dni's [lnurl-wallet](https://github.com/dni/lnurl-wallet) and checked against
 the shared
-[conformance vectors](https://github.com/TheCryptoDonkey/lnurlcash-conformance)
+[conformance vectors](https://github.com/lnurlcash/lnurlcash-conformance)
 and the adversarial mock mint.
 
 ### Design notes
