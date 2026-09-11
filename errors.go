@@ -44,9 +44,9 @@ import (
 //	AmbiguousError      the outcome is unknown. The request MAY have been
 //	                    processed. Nothing may be assumed either way.
 //	ProtocolError       a non-mutating response did not match the spec.
-//	UnverifiableError   a MUTATION landed and the service returned no signature
-//	                    over it. The note exists; it just cannot be verified
-//	                    offline.
+//	UnverifiableError   a MUTATION landed and an output came back without the
+//	                    signature it is owed: always a cp1's certificate. The
+//	                    note exists; it just cannot be verified offline.
 //
 // Treating an ambiguous failure as a definitive one is how wallets lose money:
 // a rotate that times out after the service burned the input has already
@@ -135,10 +135,10 @@ func (e *AmbiguousError) Error() string { return e.Detail }
 func (e *AmbiguousError) Unwrap() error { return e.Cause }
 
 // UnverifiableError means the service confirmed a rotate, split or merge with
-// {"status":"OK"} but returned no signature over the hash it was given. LUD-25
-// makes offline verification mandatory, so this is a non-conforming service -
-// but the mutation LANDED. The note exists, at the hash the caller disclosed,
-// and the wallet-generated secret behind it is the only key to that value
+// {"status":"OK"} but returned no certificate for a cp1 output it minted.
+// LUD-25 Part 2 requires a cs1 on every one, so this is a non-conforming
+// service - but the mutation LANDED. The note exists, at the key or hash the
+// caller disclosed, and whatever is behind it is the only key to that value
 // anywhere.
 //
 // So this is an error about the note's VERIFIABILITY, never about its
@@ -147,18 +147,21 @@ func (e *AmbiguousError) Unwrap() error { return e.Cause }
 // conformance. Persist them, then decide whether to keep dealing with a mint
 // that issues notes nobody can check.
 //
-// Only ever raised when RequireSignatures is on, which is the default.
+// Raised for a cp1 output whatever the Policy says. A plain hash output is
+// unsigned by design and only raises it when Policy.RequireSignatures asked
+// for the old Part 1 signature over the hash.
 type UnverifiableError struct {
 	Detail string
 	// NewSecrets, as AmbiguousError - and more important here, because the note
-	// is known to exist.
+	// is known to exist. Empty from the *WithHash calls, where the caller
+	// supplied every output and this package never saw what spends it.
 	NewSecrets []string
 }
 
 func (e *UnverifiableError) Error() string { return e.Detail }
 
-// IsUnverifiable reports whether a mutation landed unsigned. The note is real;
-// only its offline verifiability is missing.
+// IsUnverifiable reports whether a mutation landed without a signature it was
+// owed. The note is real; only its offline verifiability is missing.
 func IsUnverifiable(err error) bool {
 	var unverifiable *UnverifiableError
 	return errors.As(err, &unverifiable)

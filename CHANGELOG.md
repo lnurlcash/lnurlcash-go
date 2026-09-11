@@ -5,6 +5,46 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### A plain note is unsigned
+
+LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing a mint
+could attest to without disclosing the secret. The reference mint and moneyer
+now answer a rotate, split or merge to a hash output with a bare
+`{"status":"OK"}`, and under the old default this package refused every one
+of those. It follows lnurlcash-kit 0.13.0.
+
+- `Policy.RequireSignatures` is now a field, and false by default. A hash
+  output that comes back unsigned is the spec, not a fault: `Signature` (and
+  `ChangeSignature`) is empty, and no `*UnverifiableError` is raised. Set it
+  true to keep demanding the old Part 1 signature over the hash. A signature
+  that is present is passed through as before, for the caller to verify.
+- A `cp1` output is owed its `cs1` certificate whatever the `Policy` says. A
+  rotate, split or merge naming one (`p1`, or `p2` for a split's change) that
+  comes back without `sig` (or `sig2`) returns `*UnverifiableError`, carrying
+  the fresh secrets as before. From the `*WithHash` calls that is none: the
+  caller supplied the output, and this package never saw what spends it.
+- `Policy.AllowMissingMintPubkey` is new, with `Policy.RequireMintPubkey()`
+  saying it the other way round. It takes over the `withdrawRequest`
+  `mintPubkey` check the signature requirement used to carry. Still required
+  by default; set it to admit a Part 1-only mint that publishes none.
+- `Policy.AllowUnsignedNotes` is gone, and so is the `RequireSignatures()`
+  method, whose name the field now has. The old field switched off both checks
+  at once; `AllowMissingMintPubkey: true` is what is left of it.
+- `ParseMutation` takes the `Request` in place of its `NewSecrets`, and reads
+  which outputs are `cp1` off its URL. From the wire rather than a field of
+  its own, so a `Request` rebuilt from a persisted URL for LUD-25's
+  byte-identical retry is held to the same rule.
+- Graded against `lnurlcash-conformance` 0.10.0's `responses.json`, every
+  case, which this suite had never driven. Each goes through the `Client`
+  against a local server. `output` and `change` pick a `cp1` where a case
+  mints one, and the hash cases run again through the calls that draw their
+  own secrets, to grade which outcomes carry them out. CI's conformance
+  checkout moves to v0.10.0.
+
+If you relied on the default to refuse unsigned plain notes, set
+`RequireSignatures: true`. If you only ever wanted verifiable notes, hold
+`cp1` notes, the only kind the spec makes verifiable.
+
 ### LUD-25 Part 2: notes keyed by a public key
 
 `recoverable.go`, mirroring lnurlcash-kit's `recoverable.ts`.
@@ -99,19 +139,21 @@ and the adversarial mock mint.
 
 ### Design notes
 
-**Offline verification is mandatory, and this package insists on it.** LUD-25
-stopped treating a note signature as optional: a service MUST publish
-`mintPubkey` and MUST sign every note a rotate, split or merge mints. So
+**A cp1 note is certified, and this package insists on it.** LUD-25 Part 2
+certifies `cp1` notes only: a service MUST return a `cs1` for every `cp1`
+output a rotate, split or merge mints, and `ParseMutation` returns
+`*UnverifiableError` when one comes back without it, whatever the `Policy`
+says. A plain hash output is unsigned by design, and passes unsigned unless
+`Policy{RequireSignatures: true}` asks for the old Part 1 signature.
 `ParseNoteInfo` refuses a `withdrawRequest` publishing no `mintPubkey`, or one
-that is not a 33-byte compressed secp256k1 key, and `ParseMutation` returns
-`*UnverifiableError` when a service confirms a mutation without signing it.
-`Policy{AllowUnsignedNotes: true}` opts out; the field is named for what it
-permits so the zero value is the strict one.
+that is not a 33-byte compressed secp256k1 key, unless
+`Policy{AllowMissingMintPubkey: true}`; that field is named for what it
+permits, so the zero value is the strict one.
 
 That error carries the fresh secrets, and the reason matters: `status` was OK,
-so the mutation LANDED. The note exists at the hash the wallet disclosed and
-that secret is the only key to it, so enforcing the spec must never be the
-thing that strands the money.
+so the mutation LANDED. The note exists at the key or hash the wallet
+disclosed, and whatever is behind it is the only key to it, so enforcing the
+spec must never be the thing that strands the money.
 
 **A spent-or-unknown refusal from a mutation carries its secrets too.** At a
 service that has not implemented the replay rule below, a retried mutation is

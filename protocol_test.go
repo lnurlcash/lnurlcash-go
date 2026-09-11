@@ -534,17 +534,52 @@ func TestFindsTheExperimentalMintAddress(t *testing.T) {
 	}
 }
 
-// ---- mandatory offline verification ----
+// ---- what a mutation is owed ----
 
-// LUD-25 stopped treating a note signature as optional, so a service that
-// issues none is non-conforming rather than merely basic. The refusal has to be
-// the loud kind - but the rotate LANDED, and the fresh secret is the only key
-// to the note it minted, so the error carries it out. Refusing without it would
-// be this package destroying real money to make a point about conformance.
-func TestAnUnsignedRotateIsRefusedWithoutLosingTheNote(t *testing.T) {
+// A plain note is unsigned by design since LUD-25's Part 2 rewrite: a hash has
+// nothing a mint could attest to without disclosing the secret. A mint that
+// answers a rotate with a bare OK is following the spec, and the note comes
+// back with no signature - which is exactly what it is.
+func TestAnUnsignedPlainRotateIsOKByDefault(t *testing.T) {
 	mint := startMint(t, "--signatures=false")
 	client := lnurlcash.NewClient()
 	k1 := secret(30)
+	mint.credit(t, k1, 21000)
+
+	info, err := client.FetchNoteInfo(ctx(t), mint.noteURL(k1))
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+	rotated, err := client.RotateNote(ctx(t), info.Callback, k1)
+	if err != nil {
+		t.Fatalf("an unsigned plain rotate was refused: %v", err)
+	}
+	if rotated.Signature != "" {
+		t.Fatalf("an unsigned service returned a signature: %q", rotated.Signature)
+	}
+	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
+		t.Fatalf("rotated note is %s", state)
+	}
+	// and a split, whose two plain outputs are owed nothing either
+	split, err := client.SplitNote(ctx(t), info.Callback, []string{rotated.K1}, 5000)
+	if err != nil {
+		t.Fatalf("an unsigned plain split was refused: %v", err)
+	}
+	if split.Signature != "" || split.ChangeSignature != "" {
+		t.Fatalf("an unsigned service returned signatures: %q, %q", split.Signature, split.ChangeSignature)
+	}
+}
+
+// A caller who still wants the old Part 1 signature over the hash can ask for
+// it. The refusal has to be the loud kind - but the rotate LANDED, and the
+// fresh secret is the only key to the note it minted, so the error carries it
+// out. Refusing without it would be this package destroying real money to make
+// a point about a signature.
+func TestRequireSignaturesStillRefusesAnUnsignedPlainNote(t *testing.T) {
+	mint := startMint(t, "--signatures=false")
+	client := lnurlcash.NewClient()
+	client.Policy = lnurlcash.Policy{RequireSignatures: true}
+	k1 := secret(31)
 	mint.credit(t, k1, 21000)
 
 	_, err := client.RotateNote(ctx(t), mint.callback(), k1)
@@ -562,28 +597,66 @@ func TestAnUnsignedRotateIsRefusedWithoutLosingTheNote(t *testing.T) {
 	}
 }
 
-// The same mint, for a caller who has decided to deal with it anyway. One
-// field, and the note comes back unsigned - which is what it is.
-func TestAnUnsignedServiceStillWorksWhenTheCallerOptsOut(t *testing.T) {
-	mint := startMint(t, "--signatures=false")
-	client := lnurlcash.NewClient()
-	client.Policy = lnurlcash.Policy{AllowUnsignedNotes: true}
-	k1 := secret(31)
-	mint.credit(t, k1, 21000)
+// The withdrawRequest check that used to ride on the signature requirement
+// stands on its own now. A mintPubkey is what a cs1 verifies against, so it is
+// still required by default, and a caller dealing with a Part 1-only mint that
+// publishes none has to say so. Parsed straight from a body: the mock mint
+// always publishes one.
+func TestAMintPubkeyIsRequiredUnlessTheCallerAllowsItsAbsence(t *testing.T) {
+	const key = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
+	k1 := secret(40)
+	queried := "https://mint.example/w?k1=" + k1
+	answer := func(mintPubkey any) []byte {
+		body := map[string]any{
+			"tag": "withdrawRequest", "callback": "https://mint.example/w/cb",
+			"k1": k1, "maxWithdrawable": 21000,
+		}
+		if mintPubkey != nil {
+			body["mintPubkey"] = mintPubkey
+		}
+		encoded, _ := json.Marshal(body)
+		return encoded
+	}
+	// absent, empty, x-only, and not a string at all
+	unusable := []any{nil, "", key[2:], 42}
 
-	info, err := client.FetchNoteInfo(ctx(t), mint.noteURL(k1))
-	if err != nil {
-		t.Fatalf("info: %v", err)
+	// Asking for the old hash signatures does not relax it either: the two
+	// fields are independent.
+	for name, policy := range map[string]lnurlcash.Policy{"the zero Policy": {}, "RequireSignatures": {RequireSignatures: true}} {
+		if !policy.RequireMintPubkey() {
+			t.Fatalf("%s does not require a mintPubkey", name)
+		}
+		for _, mintPubkey := range unusable {
+			var byK1, byHash *lnurlcash.ProtocolError
+			if _, err := lnurlcash.ParseNoteInfo(answer(mintPubkey), queried, policy); !asProtocol(err, &byK1) {
+				t.Errorf("%s: mintPubkey %v = %v, want a protocol error", name, mintPubkey, err)
+			}
+			if _, err := lnurlcash.ParseNoteInfoByHash(answer(mintPubkey), policy); !asProtocol(err, &byHash) {
+				t.Errorf("%s: by hash, mintPubkey %v = %v, want a protocol error", name, mintPubkey, err)
+			}
+		}
 	}
-	rotated, err := client.RotateNote(ctx(t), info.Callback, k1)
-	if err != nil {
-		t.Fatalf("rotate: %v", err)
+
+	allow := lnurlcash.Policy{AllowMissingMintPubkey: true}
+	if allow.RequireMintPubkey() {
+		t.Fatal("AllowMissingMintPubkey still requires one")
 	}
-	if rotated.Signature != "" {
-		t.Fatalf("an unsigned service returned a signature: %q", rotated.Signature)
+	for _, mintPubkey := range unusable {
+		if info, err := lnurlcash.ParseNoteInfo(answer(mintPubkey), queried, allow); err != nil || info.MaxWithdrawableMsat != 21000 {
+			t.Errorf("mintPubkey %v was refused with the check off: %v", mintPubkey, err)
+		}
+		if info, err := lnurlcash.ParseNoteInfoByHash(answer(mintPubkey), allow); err != nil || info.MaxWithdrawableMsat != 21000 {
+			t.Errorf("by hash, mintPubkey %v was refused with the check off: %v", mintPubkey, err)
+		}
 	}
-	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
-		t.Fatalf("rotated note is %s", state)
+	if info, _ := lnurlcash.ParseNoteInfo(answer(nil), queried, allow); info.MintPubkey != "" {
+		t.Errorf("mintPubkey = %q from a mint that published none", info.MintPubkey)
+	}
+	// and one that is there is read the same way, whichever the policy
+	for _, policy := range []lnurlcash.Policy{{}, allow} {
+		if info, err := lnurlcash.ParseNoteInfo(answer(strings.ToUpper(key)), queried, policy); err != nil || info.MintPubkey != key {
+			t.Errorf("mintPubkey = %q (%v), want %s", info.MintPubkey, err, key)
+		}
 	}
 }
 

@@ -455,6 +455,101 @@ func TestTheClientTakesPart2NotesEndToEnd(t *testing.T) {
 	})
 }
 
+// ---- what a cp1 output is owed ----
+
+// LUD-25 Part 2 certifies cp1 notes, and only them. A mint that mints to a key
+// and answers without a cs1 has issued a note nobody can check offline, which
+// is the one thing a cp1 note is for, so no Policy waives it. The mutation
+// landed all the same: the error is about verifiability, and the note exists
+// at the caller's key.
+func TestAnUncertifiedCp1OutputIsUnverifiableWhateverThePolicy(t *testing.T) {
+	part2 := loadPart2(t)
+	hash, _ := lnurlcash.HashK1(secret(0x11))
+	base, _ := capture(t, map[string]any{"status": "OK"})
+	callback := base + "/w/cb"
+
+	for name, policy := range map[string]lnurlcash.Policy{
+		"the zero Policy":        {},
+		"AllowMissingMintPubkey": {AllowMissingMintPubkey: true},
+		"RequireSignatures":      {RequireSignatures: true},
+	} {
+		client := lnurlcash.NewClient()
+		client.Policy = policy
+		for call, mutate := range map[string]func() (lnurlcash.Mutation, error){
+			"rotate": func() (lnurlcash.Mutation, error) {
+				return client.RotateNoteWithHash(ctx(t), callback, part2.a.Ck1, part2.b.Cp1)
+			},
+			"split": func() (lnurlcash.Mutation, error) {
+				return client.SplitNoteWithHash(ctx(t), callback, []string{part2.a.Ck1}, 5000, part2.b.Cp1, hash)
+			},
+			"merge": func() (lnurlcash.Mutation, error) {
+				return client.MergeNotesWithHash(ctx(t), callback, []string{secret(0x11), part2.a.Ck1}, part2.c.Cp1)
+			},
+		} {
+			_, err := mutate()
+			if !lnurlcash.IsUnverifiable(err) {
+				t.Errorf("%s, %s: %v, want unverifiable", name, call, err)
+			}
+			// the caller named the output, so nothing of this package's rides out
+			if carried := lnurlcash.NewSecrets(err); len(carried) != 0 {
+				t.Errorf("%s, %s: carried %d secrets it never had", name, call, len(carried))
+			}
+		}
+	}
+
+	// The same bare OK to a hash is a plain note, owed nothing.
+	if _, err := lnurlcash.NewClient().RotateNoteWithHash(ctx(t), callback, part2.a.Ck1, hash); err != nil {
+		t.Errorf("an unsigned plain output was refused: %v", err)
+	}
+
+	// Read off the URL, so a request rebuilt from a persisted one - LUD-25's
+	// byte-identical retry after a restart - is held to the same rule.
+	rotate, err := lnurlcash.RotateRequestWithHash(callback, part2.a.Ck1, part2.b.Cp1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt := lnurlcash.Request{URL: rotate.URL}
+	if _, err := lnurlcash.ParseMutation([]byte(`{"status":"OK"}`), rebuilt, lnurlcash.MutationRotate, lnurlcash.Policy{}); !lnurlcash.IsUnverifiable(err) {
+		t.Errorf("a rebuilt request lost the rule: %v", err)
+	}
+	certified := []byte(`{"status":"OK","sig":"` + part2.cs1 + `"}`)
+	if mutation, err := lnurlcash.ParseMutation(certified, rebuilt, lnurlcash.MutationRotate, lnurlcash.Policy{}); err != nil || mutation.Signature != part2.cs1 {
+		t.Errorf("a certified cp1 output = %q (%v), want its cs1", mutation.Signature, err)
+	}
+}
+
+// A split's change is a note like any other. When it is a cp1 it is owed its
+// cs1 in sig2 exactly as the first output is owed one in sig, and a split that
+// certifies only the output the caller asked about has left the rest of the
+// value unverifiable.
+func TestACp1ChangeWithoutItsCertificateIsUnverifiable(t *testing.T) {
+	part2 := loadPart2(t)
+	hash, _ := lnurlcash.HashK1(secret(0x11))
+	client := lnurlcash.NewClient()
+
+	firstOnly, _ := capture(t, map[string]any{"status": "OK", "sig": part2.cs1})
+	_, err := client.SplitNoteWithHash(ctx(t), firstOnly+"/w/cb", []string{part2.a.Ck1}, 5000, hash, part2.b.Cp1)
+	if !lnurlcash.IsUnverifiable(err) {
+		t.Fatalf("a cp1 change with no sig2 = %v, want unverifiable", err)
+	}
+	if !strings.Contains(err.Error(), "change") {
+		t.Errorf("the error does not name the change: %v", err)
+	}
+
+	// The other way round the change is the hash, and a plain change is owed
+	// nothing.
+	split, err := client.SplitNoteWithHash(ctx(t), firstOnly+"/w/cb", []string{part2.a.Ck1}, 5000, part2.b.Cp1, hash)
+	if err != nil || split.Signature != part2.cs1 || split.ChangeSignature != "" {
+		t.Errorf("a cp1 output with a plain change = %+v (%v)", split, err)
+	}
+
+	// and a split to two keys that certifies both is whole
+	both, _ := capture(t, map[string]any{"status": "OK", "sig": part2.cs1, "sig2": part2.cs1})
+	if _, err := client.SplitNoteWithHash(ctx(t), both+"/w/cb", []string{part2.a.Ck1}, 5000, part2.b.Cp1, part2.c.Cp1); err != nil {
+		t.Errorf("a split certifying both keys was refused: %v", err)
+	}
+}
+
 // FuzzPart2Decoders holds the decoders to never panicking, and to accepting a
 // string only if it is the one encoding of what it decodes to. The seed corpus
 // is every string part2.json carries, so plain `go test` runs those.
