@@ -200,6 +200,26 @@ func (c *Client) FetchNoteInfo(ctx context.Context, noteURL string) (WithdrawInf
 	return ParseNoteInfo(body, noteURL, c.Policy)
 }
 
+// FetchNoteInfoByHash performs the informational GET by hash rather than by
+// secret, so the service learns which note is being asked about but never what
+// spends it. h is a hash, or a Part 2 note's cp1; NoteLookupOf gives the right
+// one for either kind of k1.
+//
+// The form to use for any lookup not immediately followed by a mutation -
+// checking a balance, and above all walking a derivation during a restore.
+// A rejection proves nothing: see BuildNoteInfoURLByHash.
+func (c *Client) FetchNoteInfoByHash(ctx context.Context, withdrawLink, h string) (WithdrawInfo, error) {
+	lookup := BuildNoteInfoURLByHash(withdrawLink, h)
+	if lookup == "" {
+		return WithdrawInfo{}, fmt.Errorf("%w: a note lookup is 32 bytes of hex or a cp1, on a withdraw link that parses", ErrRequestRefused)
+	}
+	body, err := c.do(ctx, Request{URL: lookup})
+	if err != nil {
+		return WithdrawInfo{}, err
+	}
+	return ParseNoteInfoByHash(body, c.Policy)
+}
+
 // FetchMintAddress performs the experimental mint-address GET.
 func (c *Client) FetchMintAddress(ctx context.Context, rawURL string) (MintAddress, error) {
 	request, err := MintAddressRequest(rawURL)
@@ -332,6 +352,34 @@ func (c *Client) MergeNotes(ctx context.Context, callback string, k1s []string) 
 	return RotatedNote{K1: fresh, Signature: mutation.Signature}, nil
 }
 
+// The hash-parameterised mutations: the caller supplies each output rather than
+// having this client draw a secret for it. What a hardware wallet drives, where
+// the secret never enters this process - and the only way to mint to a Part 2
+// key, which the caller derives (DeriveNotePubkey) and passes as a cp1.
+//
+// A k1 may be a Part 1 secret or a Part 2 ck1, and outputs may be hashes or
+// cp1s, mixed freely. Retried exactly as RotateNote is. There are no NewSecrets
+// on any error: the caller already holds whatever the outputs belong to, and
+// must have persisted it - with the index it came from - before calling.
+
+// RotateNoteWithHash burns k1 and mints a note of the same value to h.
+func (c *Client) RotateNoteWithHash(ctx context.Context, callback, k1, h string) (Mutation, error) {
+	request, err := RotateRequestWithHash(callback, k1, h)
+	return c.mutate(ctx, request, err, MutationRotate)
+}
+
+// SplitNoteWithHash burns k1s, minting amountMsat to h and the remainder to h2.
+func (c *Client) SplitNoteWithHash(ctx context.Context, callback string, k1s []string, amountMsat int64, h, h2 string) (Mutation, error) {
+	request, err := SplitRequestWithHash(callback, k1s, amountMsat, h, h2)
+	return c.mutate(ctx, request, err, MutationSplit)
+}
+
+// MergeNotesWithHash burns k1s and mints one note worth their sum to h.
+func (c *Client) MergeNotesWithHash(ctx context.Context, callback string, k1s []string, h string) (Mutation, error) {
+	request, err := MergeRequestWithHash(callback, k1s, h)
+	return c.mutate(ctx, request, err, MutationMerge)
+}
+
 // FetchPayRequest reads a mint's payRequest.
 func (c *Client) FetchPayRequest(ctx context.Context, rawURL string) (PayRequest, error) {
 	request, err := PayRequestRequest(rawURL)
@@ -367,6 +415,21 @@ func (c *Client) RequestInvoice(ctx context.Context, payCallback string, amountM
 // whose secret was lost is a note nobody can spend.
 func (c *Client) RequestMintInvoice(ctx context.Context, payCallback string, amountMsat int64, mintSecret string) (Invoice, error) {
 	request, err := MintInvoiceRequest(payCallback, amountMsat, mintSecret)
+	if err != nil {
+		return Invoice{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return ParseInvoice(body, amountMsat)
+}
+
+// RequestMintInvoiceWithHash asks for an invoice that mints to an output the
+// caller names: a hash, or a Part 2 cp1, which goes as the comment alone. See
+// MintInvoiceRequestWithHash.
+func (c *Client) RequestMintInvoiceWithHash(ctx context.Context, payCallback string, amountMsat int64, h string) (Invoice, error) {
+	request, err := MintInvoiceRequestWithHash(payCallback, amountMsat, h)
 	if err != nil {
 		return Invoice{}, err
 	}

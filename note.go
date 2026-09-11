@@ -53,15 +53,19 @@ func NoteSignature(rawURL string) string {
 
 // ResolveNoteInput resolves input to a note URL, or "" if it is not one.
 //
-// Input only qualifies if it carries a well-formed k1: 32 bytes hex. A k1 that
-// is not hex would fail during hashing later, so it is refused at the door.
+// Input only qualifies if it carries a well-formed k1: 32 bytes hex, or a Part 2
+// ck1 that recovers to a key. Anything else would fail during hashing later, so
+// it is refused at the door.
 func ResolveNoteInput(value string) string {
 	resolved := ResolveLnurlInput(value)
 	if resolved == "" {
 		return ""
 	}
 	k1 := NoteK1(resolved)
-	if k1 == "" || !IsPreimage(k1) {
+	if k1 == "" {
+		return ""
+	}
+	if _, err := NoteIDOf(k1); err != nil {
 		return ""
 	}
 	return resolved
@@ -106,10 +110,19 @@ func BuildNoteURL(withdrawLink, k1 string, amountMsat int64) string {
 // supported" from "no such note" - and a burned note is deliberately
 // indistinguishable from one that never existed.
 //
-// Returns "" if the hash is not 32 bytes of hex, or the link does not parse.
+// h may also be a Part 2 cp1, sent as p, the name LUD-25 now uses. A hash keeps
+// the older h, which every mint that ever took a hash lookup understands. Same
+// rule as lnurl-wallet. NoteLookupOf gives the right one for either kind of k1.
+//
+// Returns "" if h is neither 32 bytes of hex nor a cp1, or the link does not
+// parse.
 func BuildNoteInfoURLByHash(withdrawLink, h string) string {
-	hash := strings.ToLower(strings.TrimSpace(h))
-	if len(hash) != 64 || !IsPreimage(hash) {
+	value := strings.ToLower(strings.TrimSpace(h))
+	key := "h"
+	switch {
+	case IsCp1(value):
+		key = "p"
+	case !IsPreimage(value):
 		return ""
 	}
 	parsed, err := url.Parse(FromLud17(strings.TrimSpace(withdrawLink)))
@@ -120,7 +133,9 @@ func BuildNoteInfoURLByHash(withdrawLink, h string) string {
 	query.Del("k1")
 	query.Del("amount")
 	query.Del("sig")
-	ordered := encodeOrdered(query, [][2]string{{"h", hash}}, 0, "")
+	// -1, not 0: encodeOrdered writes any amount >= 0, and a lookup that
+	// promises to drop amount must not add amount=0 back
+	ordered := encodeOrdered(query, [][2]string{{key, value}}, -1, "")
 	parsed.RawQuery = ordered
 	return parsed.String()
 }

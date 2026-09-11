@@ -49,6 +49,10 @@ client.MeltNote(ctx, callback, k1, pr) (Mutation, error)
 client.SettleNote(ctx, baseURL, k1, expectedMsat, sig) (SettledNote, error)
 client.ProbeBurnedNote(ctx, url) NoteFate    // NoteLive | NoteGone | NoteFateUnknown
 client.FetchPayRequest / RequestInvoice / FetchInvoiceStatus / FetchMintAddress
+client.RotateNoteWithHash / SplitNoteWithHash / MergeNotesWithHash (Mutation)
+  / RequestMintInvoiceWithHash / FetchNoteInfoByHash
+  the caller names each output (a hash, or a Part 2 cp1) - no NewSecrets on
+  errors, so persist what the outputs belong to BEFORE calling
 
 DeriveCashRoot(seed) -> CashNode              LUD-25's scheme, BIP-32 m/139'
 DeriveCashDomainNode(root, host) -> CashNode  m/139'/d1/d2/d3/d4, d1..d4 =
@@ -69,6 +73,35 @@ BuildNoteInfoURLByHash(withdrawLink, h) + ParseNoteInfoByHash(body, policy)
   the ?h= informational GET, so a restore walk keeps secrets off the wire.
   A rejection proves nothing: unsupported, unknown and BURNED are one answer.
   The persisted per-host counter is the real backup, not the scan.
+DeriveCashMaster(seed) -> CashNode  BIP-32 m, for paths this package does not name
+
+LUD-25 Part 2 (recoverable.go): a note keyed by a public key.
+DeriveCashAddressNode(root, host) -> CashNode  m/139'/1'/d1..d4, hashing key
+  m/139'/1'/0. The REFERENCE WALLET'S path, not the spec text's m/139'/d1..d4
+  (that is the Part 1 ladder's node, and finds none of the wallet's notes)
+CashNodeToCx1(node) -> Cx1{PubkeyXOnly, ChainCode}  watch-only; links the branch
+DeriveNotePubkey(branchX, chainCode, i) -> [32]byte  watch-only; i any uint32
+DeriveNoteSecretKey(branchKey, chainCode, i) -> [32]byte  negates an odd branch
+  key first. t = tagged_hash("LNURLcash/derive", P || cc || ser32_be(i));
+  t >= n is an ERROR (use the next index), never reduced
+SignNoteOwnership(sk) -> [65]byte  RFC6979, low-S, over fixed "LNURLcash",
+  laid out r || s || recovery id (0..3)
+RecoverNoteOwnershipPubkey(sig) -> [32]byte
+EncodeCp1 / DecodeCp1 (32 bytes), Ck1 (65), Cs1 (65), Cx1 (64), IsCp1..IsCx1
+  bech32m, NO 90-char limit, all-uppercase ok; mixed case, a bech32 checksum,
+  a wrong hrp or length, or non-zero padding are refused. Never panic
+NoteIDOf(k1) -> id  sha256(k1) for a secret, the recovered key for a ck1. One
+  note has many valid ck1 strings: compare notes by this, NEVER by k1
+NoteLookupOf(k1) -> the hash, or the cp1 for a ck1; for FetchNoteInfoByHash
+Wire: a ck1 goes wherever a k1 does; a cp1 wherever an output does.
+  MintInvoiceRequestWithHash: cp1 as the comment alone (a hash: comment + h)
+  *RequestWithHash: cp1 as p1/p2, a hash as h/h2, per value
+  BuildNoteInfoURLByHash: cp1 as p, a hash as h
+VerifyNoteSignature takes a ck1 as k1 and a cs1 as the signature;
+  VerifyNoteSignatureHash / NoteSignatureMessageForHash / DigestForHash take
+  the note's id instead, for a watcher that has only the key
+DeriveNostrCashSeed(sk) / DeriveNostrAddressNode(sk, host)  EXTENSION, not
+  LUD-25: seed = HMAC-SHA256(sk, "LNURLcash/nostr-seed"), then the path above
 
 Pure functions: VerifyNoteSignature, GenerateNoteSecret, HashK1, IsPreimage,
 ResolveNoteInput, ResolveMintInput, ResolveLnurlInput, IsAllowedServiceURL,

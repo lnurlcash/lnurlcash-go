@@ -338,7 +338,7 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 	// or opaque id. A service returning something else for the k1 it was queried
 	// with is non-compliant - or the note was rotated by somebody else, which
 	// matters more.
-	if queried := NoteK1(queriedURL); queried != "" && strings.ToLower(k1) != queried {
+	if queried := NoteK1(queriedURL); queried != "" && !sameNote(k1, queried) {
 		return WithdrawInfo{}, &ProtocolError{
 			Detail: "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant",
 		}
@@ -364,8 +364,22 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 	}, nil
 }
 
+// sameNote reports whether two k1s name one note. A Part 1 secret has one
+// spelling, but a Part 2 note has as many valid ck1s as a signer has nonces -
+// and anyone can flip a signature to its high-S twin - so a service echoing a
+// different ck1 that recovers to the same key has named the same note, not a
+// different one.
+func sameNote(a, b string) bool {
+	if strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b)) {
+		return true
+	}
+	idA, errA := NoteIDOf(a)
+	idB, errB := NoteIDOf(b)
+	return errA == nil && errB == nil && idA == idB
+}
+
 // ParseNoteInfoByHash reads the same response, for a lookup that named the
-// note by its hash.
+// note by its hash - or, for a Part 2 note, by its cp1.
 //
 // Differs from ParseNoteInfo in exactly two places, both because there was no
 // secret in the request: k1 is not required in the response, and there is no
@@ -506,10 +520,32 @@ func MeltRequest(callback, k1, pr string) (Request, error) {
 	return Request{URL: built}, nil
 }
 
+// outputParam names a mutation's output. An output is a hash, or a Part 2 cp1
+// key. LUD-25 renamed the callback's h and h2 to p1 and p2; a hash keeps the
+// old names, which every mint accepts, and a key goes as p1 or p2, which only a
+// Part 2 mint takes anyway. Decided per value, never by a version flag - the
+// same rule as lnurl-wallet - and the value goes out exactly as given, so a
+// retried request stays byte-identical.
+//
+// A k1 needs no such treatment: a Part 1 secret and a Part 2 ck1 both go as
+// k1, and the service tells them apart by shape.
+func outputParam(value string, which int) [2]string {
+	if IsCp1(strings.ToLower(strings.TrimSpace(value))) {
+		return [2]string{"p" + strconv.Itoa(which), value}
+	}
+	if which == 2 {
+		return [2]string{"h2", value}
+	}
+	return [2]string{"h", value}
+}
+
 // RotateRequestWithHash builds a rotate for a hash the caller already holds -
 // what a hardware wallet drives, where the secret never enters this process.
+//
+// k1 may be a Part 2 ck1, and h a Part 2 cp1, which goes as p1: a rotate into
+// a key the wallet derived and the service only ever learns the public half of.
 func RotateRequestWithHash(callback, k1, h string) (Request, error) {
-	built, err := callbackURL(callback, [][2]string{{"k1", k1}, {"h", h}})
+	built, err := callbackURL(callback, [][2]string{{"k1", k1}, outputParam(h, 1)})
 	if err != nil {
 		return Request{}, err
 	}
@@ -517,6 +553,7 @@ func RotateRequestWithHash(callback, k1, h string) (Request, error) {
 }
 
 // SplitRequestWithHash builds a split for hashes the caller already holds.
+// Either output may be a cp1, and the two need not be the same kind.
 func SplitRequestWithHash(callback string, k1s []string, amountMsat int64, h, h2 string) (Request, error) {
 	params := make([][2]string, 0, len(k1s)+3)
 	for _, k1 := range k1s {
@@ -524,8 +561,8 @@ func SplitRequestWithHash(callback string, k1s []string, amountMsat int64, h, h2
 	}
 	params = append(params,
 		[2]string{"amount", strconv.FormatInt(amountMsat, 10)},
-		[2]string{"h", h},
-		[2]string{"h2", h2},
+		outputParam(h, 1),
+		outputParam(h2, 2),
 	)
 	built, err := callbackURL(callback, params)
 	if err != nil {
@@ -534,13 +571,14 @@ func SplitRequestWithHash(callback string, k1s []string, amountMsat int64, h, h2
 	return Request{URL: built}, nil
 }
 
-// MergeRequestWithHash builds a merge for a hash the caller already holds.
+// MergeRequestWithHash builds a merge for a hash the caller already holds. The
+// inputs may mix Part 1 secrets and Part 2 ck1s, and the output may be a cp1.
 func MergeRequestWithHash(callback string, k1s []string, h string) (Request, error) {
 	params := make([][2]string, 0, len(k1s)+1)
 	for _, k1 := range k1s {
 		params = append(params, [2]string{"k1", k1})
 	}
-	params = append(params, [2]string{"h", h})
+	params = append(params, outputParam(h, 1))
 	built, err := callbackURL(callback, params)
 	if err != nil {
 		return Request{}, err
@@ -757,18 +795,24 @@ func InvoiceRequest(payCallback string, amountMsat int64) (Request, error) {
 // settlement proof only - it can never redeem the note. That is the whole point
 // of the current draft: a preimage propagates to every routing node that
 // forwards the payment, and a note keyed by one is a note they can all spend.
+//
+// h may instead be a Part 2 cp1, minting to a key. That goes as the comment
+// alone: h is a hash-only extension, and a mint may refuse a key under it. A
+// cp1 is 61 characters, so it fits the same 64 a mint must allow.
 func MintInvoiceRequestWithHash(payCallback string, amountMsat int64, h string) (Request, error) {
 	h = strings.ToLower(strings.TrimSpace(h))
-	// Refused here rather than sent, so a wallet never pays for a quote the
-	// service was always going to reject.
-	if !IsPreimage(h) {
-		return Request{}, fmt.Errorf("%w: an output commitment must be 32 bytes of hex - no invoice was requested", ErrRequestRefused)
+	params := [][2]string{{"amount", strconv.FormatInt(amountMsat, 10)}, {"comment", h}}
+	switch {
+	case IsCp1(h):
+		// the comment is the whole of it
+	case IsPreimage(h):
+		params = append(params, [2]string{"h", h})
+	default:
+		// Refused here rather than sent, so a wallet never pays for a quote the
+		// service was always going to reject.
+		return Request{}, fmt.Errorf("%w: an output must be 32 bytes of hex or a cp1 key - no invoice was requested", ErrRequestRefused)
 	}
-	built, err := withParams(payCallback, [][2]string{
-		{"amount", strconv.FormatInt(amountMsat, 10)},
-		{"comment", h},
-		{"h", h},
-	})
+	built, err := withParams(payCallback, params)
 	if err != nil {
 		return Request{}, fmt.Errorf("%w: that pay callback does not parse", ErrRequestRefused)
 	}
