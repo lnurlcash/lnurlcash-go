@@ -198,6 +198,49 @@ upwards only. `BuildNoteInfoURLByHash` is the private lookup a walk should
 use; asking by secret publishes the very indices the wallet is about to mint
 under.
 
+## Notes keyed by a public key (LUD-25 Part 2)
+
+A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`; the mint
+only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, a
+recoverable signature by `sk` over the fixed message `LNURLcash`, and the mint
+recovers `pk` from it. The mint's certificate, `cs1…`, is the signature mints
+already make, over `hex(pk)` instead of a hash, so a recipient can check a note
+offline with nothing but its `ck1` and `cs1`.
+
+```go
+root, _ := lnurlcash.DeriveCashRoot(seed)
+node, _ := lnurlcash.DeriveCashAddressNode(root, "mint.example") // m/139'/1'/d1..d4
+cx, _ := lnurlcash.CashNodeToCx1(node)
+cx1 := lnurlcash.EncodeCx1(cx.PubkeyXOnly, cx.ChainCode)          // watch-only
+
+pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, i) // what a watcher derives
+sk, _ := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, i)
+sig, _ := lnurlcash.SignNoteOwnership(sk)
+ck1 := lnurlcash.EncodeCk1(sig)                                     // the bearer secret
+
+lnurlcash.VerifyNoteSignature(ck1, amountMsat, cs1, mintPubkey)     // offline
+```
+
+A `ck1` goes anywhere a `k1` does: a note URL, `FetchNoteInfo`, rotate, split,
+merge and melt. A `cp1` goes anywhere an output does: `RequestMintInvoiceWithHash`
+sends it as the comment alone, and the `*WithHash` calls send it as `p1`/`p2`
+while a hash keeps `h`/`h2`. `NoteIDOf(k1)` is the id a mint files either kind
+under - compare notes by it, because one note has many valid `ck1` strings -
+and `NoteLookupOf(k1)` is what to pass `FetchNoteInfoByHash`.
+
+- **The branch follows the reference wallet, not the spec text.** The text
+  says `m/139'/d1..d4`, which is the Part 1 ladder's own node; lnurl-wallet
+  uses `m/139'/1'/d1..d4`, hashing key at `m/139'/1'/0`, and so does this.
+- **A `cx1` links every note on its branch.** It spends nothing, but whoever
+  holds it can list every key on the branch. Receive on it, then rotate off.
+- **`i` is any uint32**, four bytes big-endian, never hardened.
+
+`DeriveNostrAddressNode(secretKey, host)` roots the same branch in a Nostr
+identity key instead of a seed phrase: `HMAC-SHA256(key, "LNURLcash/nostr-seed")`,
+then the path above. That is ours, not LUD-25's, and heartwood-esp32 derives
+the same branch on the device. Both are graded against conformance's
+`part2.json` and `nostr-seed.json`, every field.
+
 ## Amounts
 
 `int64` milli-satoshis, everywhere, with no exceptions.

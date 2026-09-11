@@ -111,6 +111,13 @@ func DeriveCashChild(node CashNode, index uint32) (CashNode, error) {
 	return out, nil
 }
 
+// DeriveCashMaster returns a seed's BIP-32 master node. Exported beside
+// DeriveCashChild for the same reason: a consumer walking a path this package
+// does not name (nsec-tree's m/44'/1237'/727'/0'/0', say) starts here.
+func DeriveCashMaster(seed []byte) (CashNode, error) {
+	return masterFrom(seed)
+}
+
 func masterFrom(seed []byte) (CashNode, error) {
 	var out CashNode
 	if len(seed) < 16 || len(seed) > 64 {

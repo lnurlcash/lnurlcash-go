@@ -5,6 +5,49 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### LUD-25 Part 2: notes keyed by a public key
+
+`recoverable.go`, mirroring lnurlcash-kit's `recoverable.ts`.
+
+- The four encodings: `cp1` (a note's x-only key), `ck1` (the recoverable
+  ownership signature that spends it), `cs1` (the mint's certificate) and `cx1`
+  (a watch-only branch). Strict bech32m with no length limit. The decoders
+  refuse mixed case, a bech32 checksum, a wrong prefix or length and non-zero
+  padding, with an error and never a panic.
+- `DeriveCashAddressNode`, `CashNodeToCx1`, `DeriveNotePubkey`,
+  `DeriveNoteSecretKey`, `SignNoteOwnership` and `RecoverNoteOwnershipPubkey`.
+  The branch is the reference wallet's `m/139'/1'/d1..d4`, not the spec text's
+  `m/139'/d1..d4`, which is the Part 1 ladder's own node.
+- `NoteIDOf` and `NoteLookupOf`: the id a mint files either kind of note under,
+  and what to look it up by without disclosing it. One note has many valid
+  `ck1` strings, so notes compare by id.
+- A `ck1` goes anywhere a `k1` does, and a `cp1` anywhere an output does: `p1`
+  and `p2` in the `*WithHash` requests (a hash keeps `h` and `h2`), `p` on the
+  hash lookup, and the comment alone when minting. `ResolveNoteInput` takes a
+  note URL carrying a `ck1`.
+- `VerifyNoteSignature` takes a `ck1` as the k1 and a `cs1` as the signature.
+  `VerifyNoteSignatureHash`, `NoteSignatureMessageForHash` and
+  `NoteSignatureDigestForHash` do the same from the note's id, for a watcher
+  that has only the key. All of them now refuse a hex k1 that is not 32 bytes,
+  which they used to hash regardless, as the TypeScript kit does. A note secret
+  is 32 bytes, so no real note was ever signed over one.
+- `Client` gains `RotateNoteWithHash`, `SplitNoteWithHash`,
+  `MergeNotesWithHash`, `RequestMintInvoiceWithHash` and `FetchNoteInfoByHash`.
+  Minting to a key means naming your own outputs, and a caller doing that
+  should not lose the retry and the safe transport for it.
+- `ParseNoteInfo` compares an echoed `ck1` by the note it names, so a service
+  echoing another valid spelling of the same note is not mistaken for one that
+  saw it rotated away.
+- `DeriveNostrCashSeed` and `DeriveNostrAddressNode`: a branch rooted in a
+  Nostr identity key, for a holder with no seed phrase. An extension, not
+  LUD-25.
+- `DeriveCashMaster`, for walking a path this package does not name.
+- Fixed: `BuildNoteInfoURLByHash` added `amount=0` to a lookup that promises to
+  carry no amount, which a strict mint may refuse rather than ignore.
+- Graded against `lnurlcash-conformance` 0.9.0's `part2.json` and
+  `nostr-seed.json`, every field, decoded strictly so a new field fails until
+  it is graded. CI now pins the conformance checkout to that tag.
+
 ### The import path is `github.com/lnurlcash/lnurlcash-go`
 
 The repository moved into the `lnurlcash` org. GitHub redirects the old path

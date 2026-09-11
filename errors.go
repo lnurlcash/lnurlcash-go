@@ -16,6 +16,10 @@
 //	callback?k1=X&amount=<msat>&h=..&h2=.. split
 //	callback?k1=X&k1=Y&h=<sha256(Z)>       merge
 //
+// A LUD-25 Part 2 note is keyed by a public key instead (see recoverable.go):
+// it goes in k1 as a ck1, and an output minted to a key goes as p1=<cp1> - p2
+// for a split's change - in place of h and h2.
+//
 // Amounts are int64 milli-satoshis, everywhere, with no exceptions.
 //
 // Draft spec: https://github.com/lnurl/luds/pull/301

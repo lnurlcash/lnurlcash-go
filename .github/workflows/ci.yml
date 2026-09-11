@@ -24,9 +24,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # pinned, so a new vector file lands here as a deliberate bump rather
+      # than as a red build on a commit that changed nothing
       - uses: actions/checkout@v4
         with:
           repository: lnurlcash/lnurlcash-conformance
+          ref: v0.9.0
           path: conformance
       # the mock mint is a Node process with its own dependencies - without
       # these the adversarial suite cannot start it
