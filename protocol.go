@@ -1,8 +1,11 @@
 package lnurlcash
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -234,9 +237,23 @@ func withParams(rawURL string, params [][2]string) (string, error) {
 	return parsed.String(), nil
 }
 
+// decode keeps every number as the text it arrived as. Unmarshalled into a
+// float64, an amount is rounded before anything can check it: 21000.5 becomes
+// 21000, and a value past 2^63 becomes whatever the platform's conversion makes
+// of it. As a json.Number it reaches msat intact, which reads it exactly or not
+// at all.
 func decode(body []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
 	var parsed map[string]any
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	err := decoder.Decode(&parsed)
+	if err == nil {
+		// one JSON value and nothing after it, as json.Unmarshal insists
+		if _, trailing := decoder.Token(); !errors.Is(trailing, io.EOF) {
+			err = errors.New("unexpected data after the JSON value")
+		}
+	}
+	if err != nil {
 		return nil, &AmbiguousError{Detail: "the service returned an unreadable response", Cause: err}
 	}
 	return parsed, nil
@@ -292,16 +309,19 @@ func isoDate(body map[string]any, key string) string {
 	return raw
 }
 
+// msat reads an amount exactly: a JSON integer, spelt as one, that fits an
+// int64. msat are integers, so 21000.5 is refused rather than truncated, and a
+// value an int64 cannot hold is refused rather than clamped. Whether a negative
+// is acceptable is the caller's to say.
 func msat(body map[string]any, key string) (int64, bool) {
-	switch value := body[key].(type) {
-	case float64:
-		return int64(value), true
-	case json.Number:
-		parsed, err := value.Int64()
-		return parsed, err == nil
-	default:
+	number, ok := body[key].(json.Number)
+	if !ok {
 		return 0, false
 	}
+	// strconv.ParseInt underneath: base 10 digits only, and a range error
+	// rather than a saturated value
+	parsed, err := number.Int64()
+	return parsed, err == nil
 }
 
 // ---- the informational GET ----

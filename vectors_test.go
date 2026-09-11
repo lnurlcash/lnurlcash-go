@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1509,6 +1510,101 @@ func TestResponseVectors(t *testing.T) {
 			}
 			if strings.Join(carried, ",") != strings.Join(drawn, ",") {
 				t.Errorf("a %s outcome carried %d secrets, want the %d drawn, in output order", c.Expect, len(carried), len(drawn))
+			}
+		})
+	}
+}
+
+// ---- withdraw-info.json ----
+//
+// The informational GET, driven through the Client against a local server that
+// answers with each case's body, byte for byte as the vector spells it. The
+// queried URL is the vector's own, moved onto that server, so the request the
+// Client actually sends is graded as well as how it reads the answer.
+
+type withdrawInfoCase struct {
+	Name            string          `json:"name"`
+	Body            json.RawMessage `json:"body"`
+	MaxWithdrawable *int64          `json:"maxWithdrawable"`
+	Why             string          `json:"why"`
+}
+
+func TestWithdrawInfoVectors(t *testing.T) {
+	var vectors struct {
+		Version                  int                `json:"version"`
+		Spec                     string             `json:"spec"`
+		Description              string             `json:"description"`
+		QueriedURL               string             `json:"queriedUrl"`
+		RequestMustNotSend       []string           `json:"requestMustNotSend"`
+		RequestMustSendUnchanged []string           `json:"requestMustSendUnchanged"`
+		Accepted                 []withdrawInfoCase `json:"accepted"`
+		Rejected                 []withdrawInfoCase `json:"rejected"`
+	}
+	loadVectorsStrict(t, "withdraw-info.json", &vectors)
+	if vectors.Version != 1 {
+		t.Fatalf("withdraw-info.json is format version %d; these tests read version 1", vectors.Version)
+	}
+	queried, err := url.Parse(vectors.QueriedURL)
+	if err != nil {
+		t.Fatalf("queriedUrl does not parse: %v", err)
+	}
+
+	fetch := func(t *testing.T, c withdrawInfoCase) (lnurlcash.WithdrawInfo, error) {
+		t.Helper()
+		sent := make(chan url.Values, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case sent <- r.URL.Query():
+			default:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(c.Body)
+		}))
+		t.Cleanup(server.Close)
+		info, err := lnurlcash.NewClient().FetchNoteInfo(ctx(t), server.URL+queried.RequestURI())
+
+		var query url.Values
+		select {
+		case query = <-sent:
+		default:
+			t.Fatal("no request reached the service")
+		}
+		for _, key := range vectors.RequestMustNotSend {
+			if query.Has(key) {
+				t.Errorf("sent %s, which the service must never see", key)
+			}
+		}
+		for _, key := range vectors.RequestMustSendUnchanged {
+			if got, want := query[key], queried.Query()[key]; strings.Join(got, "&") != strings.Join(want, "&") {
+				t.Errorf("sent %s=%q, want it unchanged as %q", key, got, want)
+			}
+		}
+		return info, err
+	}
+
+	for _, c := range vectors.Accepted {
+		t.Run("accepted/"+c.Name, func(t *testing.T) {
+			if c.MaxWithdrawable == nil {
+				t.Fatal("an accepted case states no maxWithdrawable to grade")
+			}
+			info, err := fetch(t, c)
+			if err != nil {
+				t.Fatalf("refused: %v (%s)", err, c.Why)
+			}
+			if info.MaxWithdrawableMsat != *c.MaxWithdrawable {
+				t.Errorf("worth %d msat, want %d", info.MaxWithdrawableMsat, *c.MaxWithdrawable)
+			}
+		})
+	}
+	for _, c := range vectors.Rejected {
+		t.Run("rejected/"+c.Name, func(t *testing.T) {
+			if c.MaxWithdrawable != nil {
+				t.Fatal("a rejected case states a maxWithdrawable, which nothing can grade")
+			}
+			info, err := fetch(t, c)
+			var protocol *lnurlcash.ProtocolError
+			if !asProtocol(err, &protocol) {
+				t.Fatalf("got %v and a note worth %d msat, want a ProtocolError (%s)", err, info.MaxWithdrawableMsat, c.Why)
 			}
 		})
 	}

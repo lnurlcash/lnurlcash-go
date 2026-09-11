@@ -5,6 +5,19 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Amounts are read exactly
+
+- An informational GET whose `maxWithdrawable` or `minWithdrawable` is not a
+  JSON integer that fits an `int64` is now a `*ProtocolError`. `21000.5` used
+  to read as 21000, and a value past 2^63 as `MaxInt64` on arm64. Integer
+  spelling only, so `21000.0` and `2.1e4` are refused too. Responses are
+  decoded with numbers kept as text, so no amount passes through a float64,
+  and an optional amount elsewhere (a payRequest, a mint address) that fails
+  the same read is treated as absent.
+- Graded against `lnurlcash-conformance` 0.10.0's `withdraw-info.json`, every
+  case, through the `Client` against a local server, including the request it
+  sends: `sig` stays behind and `k1` goes out unchanged.
+
 ### A plain note is unsigned
 
 LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing a mint
