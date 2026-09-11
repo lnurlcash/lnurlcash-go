@@ -32,7 +32,7 @@ mid-mutation, and failed two tests until the transport changed.
 
 **LUD-25 has since closed the hole at the other end.** A service MUST now
 answer a byte-identical rotate, split or merge with the success it already
-returned, signature and all, rather than with the already-spent refusal. So
+returned, any signatures included, rather than with the already-spent refusal. So
 `Client` re-sends a mutation whose answer was lost — deliberately, bounded, and
 never a melt — and a dropped connection usually resolves into a completed
 mutation instead of an unresolved maybe:
@@ -55,18 +55,32 @@ has not caught up still answers the second attempt as already spent, and a
 fresh connection per request is not a cost worth weighing against leaving that
 to chance. **If you supply your own `*http.Client`, do the same.**
 
-## Offline verification is mandatory
+## Only a cp1 note is certified
 
-A service MUST publish `mintPubkey` and MUST sign every note a rotate, split or
-merge mints. `ParseNoteInfo` refuses a `withdrawRequest` publishing no valid
-one, and a mutation the service confirms but does not sign returns
-`*UnverifiableError` — which **carries the fresh secrets**, because the
-mutation landed and the note it minted is real. Read them with `NewSecrets`
-and persist them before anything else.
+LUD-25 Part 2 certifies `cp1` notes only. A plain hash has nothing a mint could
+attest to without disclosing the secret, so a rotate, split or merge to a hash
+output comes back as a bare `{"status":"OK"}`, and its `Signature` is empty.
+That is the spec, not a fault. A mint that predates the rewrite may still give
+the old Part 1 signature over the hash; it is passed through for you to verify.
 
-`Policy{AllowUnsignedNotes: true}` opts out for a service that predates the
-requirement. The zero value is the strict one, so a caller has to say the
-dangerous thing out loud.
+A `cp1` output is owed its `cs1` certificate, always, and no `Policy` waives
+it. A mutation to one that the service confirms without it returns
+`*UnverifiableError`, which **carries the fresh secrets**, because the mutation
+landed and the note it minted is real. Read them with `NewSecrets` and persist
+them before anything else. The `*WithHash` calls have none to carry: you named
+the output, so you already hold what spends it.
+
+`ParseNoteInfo` still refuses a `withdrawRequest` publishing no valid
+`mintPubkey`, because that key is what a `cs1` verifies against.
+
+The zero `Policy` is the default. Two fields move it:
+
+- `RequireSignatures: true` also demands the old Part 1 signature over a hash
+  output, for a caller that wants the pre-rewrite behaviour back.
+- `AllowMissingMintPubkey: true` admits a Part 1-only mint that publishes no
+  `mintPubkey`. Nothing it issues can then be verified offline.
+
+To hold a note a recipient can check offline, rotate it into a `cp1` key.
 
 ## Usage
 
@@ -112,8 +126,12 @@ Everything about the protocol is a `Request`/`Parse` pair with no I/O in it:
 request, err := lnurlcash.RotateRequest(callback, k1, freshSecret)
 // request.URL to GET, request.NewSecrets to persist FIRST
 body, err := yourTransport(request.URL)
-mutation, err := lnurlcash.ParseMutation(body, request.NewSecrets)
+mutation, err := lnurlcash.ParseMutation(body, request, lnurlcash.MutationRotate, lnurlcash.Policy{})
 ```
+
+`ParseMutation` takes the whole `Request` back. Its URL records which outputs
+were `cp1` keys, and so which are owed a certificate, which means a
+`Request{URL, NewSecrets}` rebuilt from what you persisted is read the same way.
 
 `Client` is a thin loop over exactly these. If you use them directly, the
 retry warning above is yours to honour.
@@ -143,6 +161,7 @@ the unpaid invoice can poll for it. First rotater wins.
 | `IsSpent(err)` | authoritative: already burned. |
 | `IsUnknownNote(err)` | the service does not recognise it. |
 | `IsAmbiguous(err)` | outcome **unknown**. `NewSecrets(err)` carries the secrets. |
+| `IsUnverifiable(err)` | the mutation **landed**, but a `cp1` output came back without its `cs1`. `NewSecrets(err)` carries the secrets. |
 | `*ProtocolError` | a non-mutating response did not match the spec. |
 
 ## Two things ports get wrong
@@ -203,9 +222,10 @@ under.
 A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`; the mint
 only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, a
 recoverable signature by `sk` over the fixed message `LNURLcash`, and the mint
-recovers `pk` from it. The mint's certificate, `cs1…`, is the signature mints
-already make, over `hex(pk)` instead of a hash, so a recipient can check a note
-offline with nothing but its `ck1` and `cs1`.
+recovers `pk` from it. The mint's certificate, `cs1…`, is the same signature
+Part 1 mints gave over a hash, over `hex(pk)` instead, so a recipient can check
+a note offline with nothing but its `ck1` and `cs1`. A `cp1` note is the only
+kind the spec certifies.
 
 ```go
 root, _ := lnurlcash.DeriveCashRoot(seed)

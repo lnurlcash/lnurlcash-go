@@ -13,10 +13,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -768,7 +771,7 @@ func loadVectorsStrict(t *testing.T, name string, target any) {
 	path := filepath.Join(vectorsDir(t), name)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Skipf("conformance vectors not found at %s - check out lnurlcash-conformance v0.9.0 or later alongside this repo, or set LNURLCASH_CONFORMANCE", path)
+		t.Skipf("conformance vectors not found at %s - check out lnurlcash-conformance v0.10.0 or later alongside this repo, or set LNURLCASH_CONFORMANCE", path)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -1277,6 +1280,235 @@ func TestNostrSeedVectors(t *testing.T) {
 				t.Run(fmt.Sprintf("index %d", note.Index), func(t *testing.T) {
 					gradeNote(t, node, watched, note)
 				})
+			}
+		})
+	}
+}
+
+// ---- responses.json ----
+//
+// How a mutating callback's answer is classified, driven through the Client
+// against a local server that answers exactly as each case says. `op` picks the
+// call, and `output` and `change` the kind of note it mints: a hash unless the
+// case says cp1, because only a cp1 is owed a certificate. Each case with only
+// hash outputs is driven a second time through the call that draws its own
+// secrets, so the vectors grade which outcomes carry those secrets out as well
+// as how each is classified. Retries are off, so one case is one request: the
+// replay has tests of its own.
+
+type responseCase struct {
+	Name            string          `json:"name"`
+	Op              string          `json:"op"`
+	Output          string          `json:"output"`
+	Change          string          `json:"change"`
+	HTTP            int             `json:"http"`
+	Body            json.RawMessage `json:"body"`
+	BodyRaw         *string         `json:"bodyRaw"`
+	TransportError  bool            `json:"transportError"`
+	Timeout         bool            `json:"timeout"`
+	Expect          string          `json:"expect"`
+	Why             string          `json:"why"`
+	Signature       string          `json:"signature"`
+	ChangeSignature string          `json:"changeSignature"`
+}
+
+// respond serves one case's answer and returns the callback to send it to.
+func respond(t *testing.T, c responseCase) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case c.TransportError:
+			// the request arrived; the answer never leaves
+			if hijacker, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hijacker.Hijack(); err == nil {
+					_ = conn.Close()
+				}
+			}
+		case c.Timeout:
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+		default:
+			status := c.HTTP
+			if status == 0 {
+				status = http.StatusOK
+			}
+			body := []byte(c.Body)
+			if c.BodyRaw != nil {
+				body = []byte(*c.BodyRaw)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write(body)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/w/cb"
+}
+
+// outcomeOf names an answer in responses.json's own words.
+func outcomeOf(err error) string {
+	var service *lnurlcash.ServiceError
+	switch {
+	case err == nil:
+		return "ok"
+	case lnurlcash.IsUnverifiable(err):
+		return "unverifiable"
+	case errors.Is(err, lnurlcash.ErrNotePending):
+		return "pending"
+	case lnurlcash.IsSpent(err):
+		return "spent"
+	case lnurlcash.IsUnknownNote(err):
+		return "unknown"
+	case lnurlcash.IsAmbiguous(err):
+		return "ambiguous"
+	case errors.As(err, &service):
+		return "error"
+	}
+	return fmt.Sprintf("unclassified (%T: %v)", err, err)
+}
+
+func gradeResponse(t *testing.T, c responseCase, mutation lnurlcash.Mutation, err error) {
+	t.Helper()
+	if got := outcomeOf(err); got != c.Expect {
+		t.Fatalf("classified as %s, want %s (%s)", got, c.Expect, c.Why)
+	}
+	if err != nil {
+		return
+	}
+	if mutation.Signature != c.Signature || mutation.ChangeSignature != c.ChangeSignature {
+		t.Errorf("signatures = %q, %q; want %q, %q", mutation.Signature, mutation.ChangeSignature, c.Signature, c.ChangeSignature)
+	}
+	if c.Op == "melt" {
+		var proof struct {
+			PR     string `json:"pr"`
+			Verify string `json:"verify"`
+		}
+		_ = json.Unmarshal(c.Body, &proof)
+		if mutation.PR != proof.PR || mutation.VerifyURL != proof.Verify {
+			t.Errorf("melt proof = %q, %q; want %q, %q", mutation.PR, mutation.VerifyURL, proof.PR, proof.Verify)
+		}
+	}
+}
+
+func TestResponseVectors(t *testing.T) {
+	var vectors struct {
+		Version     int               `json:"version"`
+		Spec        string            `json:"spec"`
+		Description string            `json:"description"`
+		Outcomes    map[string]string `json:"outcomes"`
+		Cases       []responseCase    `json:"cases"`
+	}
+	loadVectorsStrict(t, "responses.json", &vectors)
+	if vectors.Version != 1 {
+		t.Fatalf("responses.json is format version %d; these tests read version 1", vectors.Version)
+	}
+
+	// Every outcome this test tells apart, and whether it carries the fresh
+	// secrets out: the ones that can describe a mutation that landed. A new
+	// outcome is a new thing a wallet must do, and fails here until graded.
+	carries := map[string]bool{
+		"ok": false, "unverifiable": true, "pending": false, "spent": true,
+		"unknown": true, "error": false, "ambiguous": true,
+	}
+	for outcome := range vectors.Outcomes {
+		if _, graded := carries[outcome]; !graded {
+			t.Errorf("outcome %q is not graded here", outcome)
+		}
+	}
+
+	var cp1Outputs, cp1Changes int
+	for _, c := range vectors.Cases {
+		for _, kind := range []string{c.Output, c.Change} {
+			if kind != "" && kind != "cp1" {
+				t.Fatalf("%s: an output of kind %q, which this test cannot mint", c.Name, kind)
+			}
+		}
+		if c.Output == "cp1" {
+			cp1Outputs++
+		}
+		if c.Change == "cp1" {
+			cp1Changes++
+		}
+	}
+	if cp1Outputs == 0 || cp1Changes == 0 {
+		t.Fatal("responses.json names no cp1 output or change - it predates lnurlcash-conformance v0.10.0")
+	}
+
+	k1 := strings.Repeat("a", 64)
+	output, change := strings.Repeat("b", 64), strings.Repeat("c", 64)
+	var key [32]byte
+	for i := range key {
+		key[i] = 0x0b
+	}
+	cp1 := lnurlcash.EncodeCp1(key)
+
+	for _, c := range vectors.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			if _, graded := carries[c.Expect]; !graded {
+				t.Fatalf("expects %q, which this test does not grade", c.Expect)
+			}
+			callback := respond(t, c)
+			client := lnurlcash.NewClient()
+			client.MutationRetries = -1
+			if c.Timeout {
+				client.Timeout = 100 * time.Millisecond
+			}
+			first, second := output, change
+			if c.Output == "cp1" {
+				first = cp1
+			}
+			if c.Change == "cp1" {
+				second = cp1
+			}
+
+			var mutation lnurlcash.Mutation
+			var err error
+			switch c.Op {
+			case "melt":
+				mutation, err = client.MeltNote(ctx(t), callback, k1, "lnbc210n1pjq")
+			case "split":
+				mutation, err = client.SplitNoteWithHash(ctx(t), callback, []string{k1}, 5000, first, second)
+			case "mutation":
+				mutation, err = client.RotateNoteWithHash(ctx(t), callback, k1, first)
+			default:
+				t.Fatalf("op %q is not a call this test drives", c.Op)
+			}
+			gradeResponse(t, c, mutation, err)
+			// the caller named every output, so nothing of this package's rides out
+			if carried := lnurlcash.NewSecrets(err); len(carried) != 0 {
+				t.Errorf("carried %d secrets it never had", len(carried))
+			}
+
+			if c.Op == "melt" || c.Output == "cp1" || c.Change == "cp1" {
+				return
+			}
+			// the same answer, to a call that drew its own secrets
+			var drawn []string
+			client.Secrets = func() (string, error) {
+				drawn = append(drawn, secret(byte(0x40+len(drawn))))
+				return drawn[len(drawn)-1], nil
+			}
+			if c.Op == "split" {
+				notes, splitErr := client.SplitNote(ctx(t), callback, []string{k1}, 5000)
+				mutation = lnurlcash.Mutation{Signature: notes.Signature, ChangeSignature: notes.ChangeSignature}
+				err = splitErr
+			} else {
+				note, rotateErr := client.RotateNote(ctx(t), callback, k1)
+				mutation = lnurlcash.Mutation{Signature: note.Signature}
+				err = rotateErr
+			}
+			gradeResponse(t, c, mutation, err)
+			carried := lnurlcash.NewSecrets(err)
+			if !carries[c.Expect] {
+				if len(carried) != 0 {
+					t.Errorf("a %s outcome carried %d secrets", c.Expect, len(carried))
+				}
+				return
+			}
+			if strings.Join(carried, ",") != strings.Join(drawn, ",") {
+				t.Errorf("a %s outcome carried %d secrets, want the %d drawn, in output order", c.Expect, len(carried), len(drawn))
 			}
 		})
 	}

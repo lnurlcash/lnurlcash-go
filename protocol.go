@@ -17,6 +17,10 @@ import (
 // loop over exactly these.
 
 // Request is one GET, and the secrets whose loss would destroy money.
+//
+// For a rotate, split or merge, ParseMutation wants the whole Request back:
+// the URL records which outputs were cp1 keys, and so which are owed a
+// certificate.
 type Request struct {
 	URL string
 	// NewSecrets are the fresh wallet-generated secrets this request disclosed
@@ -27,25 +31,36 @@ type Request struct {
 }
 
 // Policy is what this package insists a service does, rather than merely hopes
-// it does.
+// it does. The zero value is the default, and the right one against a mint
+// that follows the current draft.
 //
-// LUD-25 makes offline verification mandatory: a service MUST publish
-// mintPubkey and MUST sign every note a rotate, split or merge mints. A wallet
-// that quietly accepted unsigned notes would be handing its holder something
-// nobody downstream can check, which is the exact gap offline verification
-// exists to close - so the zero value insists.
-//
-// Set RequireSignatures false only to talk to a service that predates the
-// requirement, and only knowing the cost.
+// LUD-25 Part 2 certifies cp1 notes only. A rotate, split or merge to a cp1
+// output owes that output its cs1 certificate, and this package always
+// insists on it: nothing here waives it, because a cp1 note nobody can check
+// offline has lost the one thing it is for. A plain hash output has nothing a
+// mint could attest to without disclosing the secret, so it comes back
+// unsigned by design, and that is the spec rather than a fault.
 type Policy struct {
-	// AllowUnsignedNotes turns the requirement off. Named for what it permits
-	// rather than what it demands, so the zero-value Policy is the strict one
-	// and a caller has to say the dangerous thing out loud.
-	AllowUnsignedNotes bool
+	// RequireSignatures also demands the old Part 1 signature over a plain
+	// hash output, as every mint that predates the Part 2 rewrite gave one.
+	// Off by default: a mint following the current draft answers a plain
+	// rotate with a bare {"status":"OK"}, and refusing that would be refusing
+	// the spec. lnurlcash-kit's requireSignatures.
+	RequireSignatures bool
+
+	// AllowMissingMintPubkey admits a withdrawRequest that publishes no
+	// mintPubkey, or one that is not a compressed secp256k1 key: a Part
+	// 1-only mint, say. Named for what it permits rather than what it
+	// demands, so the zero-value Policy is the strict one and a caller has to
+	// say the dangerous thing out loud. Without that key a cs1 verifies
+	// against nothing, so nothing such a mint issues can be checked offline.
+	AllowMissingMintPubkey bool
 }
 
-// RequireSignatures reports whether this policy insists on verifiable notes.
-func (p Policy) RequireSignatures() bool { return !p.AllowUnsignedNotes }
+// RequireMintPubkey reports whether a withdrawRequest must publish a usable
+// mintPubkey: lnurlcash-kit's requireMintPubkey, true unless the caller set
+// AllowMissingMintPubkey.
+func (p Policy) RequireMintPubkey() bool { return !p.AllowMissingMintPubkey }
 
 // MutationKind says which mutation a response is being read as, which decides
 // what it must carry. A melt mints nothing, so it has no signature to return
@@ -88,11 +103,11 @@ type WithdrawInfo struct {
 	MaxWithdrawableMsat int64
 	MinWithdrawableMsat int64
 	DefaultDescription  string
-	// MintPubkey is the key this service's note signatures verify against.
+	// MintPubkey is the key this service's note signatures verify against: a
+	// cp1 note's cs1, or the old Part 1 signature over a hash.
 	//
-	// LUD-25 makes offline verification mandatory, so a conforming service
-	// always publishes it here. Only ever empty when the caller passed a Policy
-	// with RequireSignatures false.
+	// A conforming service always publishes it here. Only ever empty, or not
+	// a compressed key, when the caller's Policy set AllowMissingMintPubkey.
 	MintPubkey string
 }
 
@@ -193,7 +208,13 @@ type InvoiceStatus struct {
 
 // Mutation is a mutating callback's answer.
 type Mutation struct {
-	Signature       string
+	// Signature is sig, over the output. For a cp1 output it is the cs1
+	// certificate, and never empty: ParseMutation refuses the answer without
+	// it. For a plain hash output it is empty from a mint following the
+	// current draft, and the old Part 1 signature from one that still gives
+	// it.
+	Signature string
+	// ChangeSignature is sig2, the same for a split's change.
 	ChangeSignature string
 	// PR and VerifyURL form the optional LUD-25 melt proof.
 	PR        string
@@ -347,7 +368,7 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 	// Separate from the shape check above, and separately worded: this response
 	// IS a withdrawRequest, it just describes a note nobody can check offline.
 	// Saying "not a withdrawRequest" would send a caller after the wrong fault.
-	if policy.RequireSignatures() && !IsCompressedPubkey(mintPubkey) {
+	if policy.RequireMintPubkey() && !IsCompressedPubkey(mintPubkey) {
 		detail := "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key"
 		if mintPubkey == "" {
 			detail = "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)"
@@ -383,9 +404,9 @@ func sameNote(a, b string) bool {
 //
 // Differs from ParseNoteInfo in exactly two places, both because there was no
 // secret in the request: k1 is not required in the response, and there is no
-// echo to check against. Everything else - the shape, and the mandatory
-// mintPubkey - is enforced identically, because a note nobody can verify
-// offline is no more acceptable when it was looked up privately.
+// echo to check against. Everything else - the shape, and the mintPubkey the
+// Policy requires by default - is enforced identically, because a note nobody
+// can verify offline is no more acceptable when it was looked up privately.
 //
 // K1 on the returned value is empty: a conforming service has nothing to echo
 // when the request never named a secret, and the caller already holds it.
@@ -416,7 +437,7 @@ func ParseNoteInfoByHash(body []byte, policy Policy) (WithdrawInfo, error) {
 		}
 	}
 	mintPubkey := str(parsed, "mintPubkey")
-	if policy.RequireSignatures() && !IsCompressedPubkey(mintPubkey) {
+	if policy.RequireMintPubkey() && !IsCompressedPubkey(mintPubkey) {
 		detail := "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key"
 		if mintPubkey == "" {
 			detail = "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)"
@@ -642,13 +663,20 @@ func MergeRequest(callback string, k1s []string, newSecret string) (Request, err
 	return request, nil
 }
 
-// ParseMutation classifies a mutating callback's response.
+// ParseMutation classifies a mutating callback's response. request is the one
+// the builder returned and the GET was made with.
 //
 // A 200 that does not confirm is an AmbiguousError, not a failure: the service
-// may have applied the mutation and merely failed to say so. newSecrets are
-// attached to any ambiguous outcome so nothing can lose them between the call
-// and the check.
-func ParseMutation(body []byte, newSecrets []string, kind MutationKind, policy Policy) (Mutation, error) {
+// may have applied the mutation and merely failed to say so. The request's
+// NewSecrets are attached to any ambiguous outcome so nothing can lose them
+// between the call and the check.
+//
+// A confirmed rotate, split or merge that owes a signature and did not return
+// one is an UnverifiableError. A cp1 output always owes its cs1; a hash output
+// owes the old Part 1 signature only when the Policy asks for it. Which
+// outputs were cp1 is read off request.URL - see certifiedOutputs.
+func ParseMutation(body []byte, request Request, kind MutationKind, policy Policy) (Mutation, error) {
+	newSecrets := request.NewSecrets
 	parsed, err := decode(body)
 	if err != nil {
 		var ambiguous *AmbiguousError
@@ -678,32 +706,8 @@ func ParseMutation(body []byte, newSecrets []string, kind MutationKind, policy P
 		}
 	}
 	signature, changeSignature := str(parsed, "sig"), str(parsed, "sig2")
-	// Every mutation the replay rule covers owes a signature over each note it
-	// mints. The mutation has already landed by the time this is checked -
-	// status was OK - so the refusal carries the caller's secrets out with it,
-	// or enforcing the spec becomes the thing that loses the money.
-	if policy.RequireSignatures() {
-		what := ""
-		switch {
-		case kind == MutationMelt:
-		case signature == "":
-			what = map[MutationKind]string{
-				MutationRotate: "rotate",
-				MutationSplit:  "split",
-				MutationMerge:  "merge",
-			}[kind]
-		case kind == MutationSplit && changeSignature == "":
-			what = "split's change"
-		}
-		if what != "" {
-			return Mutation{}, &UnverifiableError{
-				Detail: fmt.Sprintf(
-					"the service confirmed the %s but returned no signature, so the note it just minted cannot be verified offline. The note exists - keep the secret",
-					what,
-				),
-				NewSecrets: newSecrets,
-			}
-		}
+	if err := unsignedOutput(request, kind, policy, signature, changeSignature); err != nil {
+		return Mutation{}, err
 	}
 	return Mutation{
 		Signature:       signature,
@@ -711,6 +715,82 @@ func ParseMutation(body []byte, newSecrets []string, kind MutationKind, policy P
 		PR:              str(parsed, "pr"),
 		VerifyURL:       str(parsed, "verify"),
 	}, nil
+}
+
+// unsignedOutput finds the first output of a confirmed mutation that came back
+// without the signature its kind is owed, in output order so the error names
+// the one actually missing.
+//
+// A cp1 output is owed its cs1 whatever the Policy says. A hash output is a
+// plain note, unsigned by design, and is only refused for coming back unsigned
+// when the caller asked for the old Part 1 signature. A signature that is
+// present is passed through either way, for the caller to verify. A melt mints
+// nothing and owes nothing.
+//
+// The mutation has already landed by the time this is checked - status was OK
+// - so the refusal carries the caller's secrets out with it, or enforcing the
+// spec becomes the thing that loses the money.
+func unsignedOutput(request Request, kind MutationKind, policy Policy, signature, changeSignature string) error {
+	if kind == MutationMelt {
+		return nil
+	}
+	type owed struct {
+		what, signature string
+		cp1             bool
+	}
+	cp1Output, cp1Change := certifiedOutputs(request.URL)
+	name := map[MutationKind]string{MutationRotate: "rotate", MutationSplit: "split", MutationMerge: "merge"}[kind]
+	outputs := []owed{{name, signature, cp1Output}}
+	if kind == MutationSplit {
+		outputs = append(outputs, owed{"split's change", changeSignature, cp1Change})
+	}
+	for _, output := range outputs {
+		switch {
+		case output.signature != "":
+		case output.cp1:
+			return &UnverifiableError{
+				Detail: fmt.Sprintf(
+					"the service confirmed the %s but returned no cs1 certificate for the cp1 note it minted, which LUD-25 Part 2 requires, so that note cannot be verified offline. The note exists - keep its key",
+					output.what,
+				),
+				NewSecrets: request.NewSecrets,
+			}
+		case policy.RequireSignatures:
+			return &UnverifiableError{
+				Detail: fmt.Sprintf(
+					"the service confirmed the %s but returned no signature, so the note it just minted cannot be verified offline. The note exists - keep the secret",
+					output.what,
+				),
+				NewSecrets: request.NewSecrets,
+			}
+		}
+	}
+	return nil
+}
+
+// certifiedOutputs reports which of a mutation's outputs are Part 2 keys: p1
+// names the output and p2 a split's change, and outputParam only ever sends a
+// cp1 under either.
+//
+// Read off the URL rather than kept in a field of its own. The URL is the
+// record of what the service was actually asked to mint, and it is what a
+// wallet persists to make LUD-25's byte-identical retry after a restart - so
+// a Request rebuilt from it is held to the same rule as the one the builder
+// returned, with nothing extra to remember.
+func certifiedOutputs(rawURL string) (output, change bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false, false
+	}
+	for _, pair := range parseOrdered(parsed.RawQuery) {
+		switch pair[0] {
+		case "p1":
+			output = output || IsCp1(pair[1])
+		case "p2":
+			change = change || IsCp1(pair[1])
+		}
+	}
+	return output, change
 }
 
 // ---- minting ----

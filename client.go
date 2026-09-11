@@ -31,8 +31,9 @@ type Client struct {
 	// Secrets supplies replacement note secrets. Nil means the OS CSPRNG.
 	Secrets SecretSource
 
-	// Policy is what this client insists a service does. The zero value
-	// requires the offline verification LUD-25 makes mandatory.
+	// Policy is what this client insists a service does. The zero value is
+	// the default: a cp1 output must come back certified and a withdrawRequest
+	// must publish mintPubkey, while a plain note need not be signed.
 	Policy Policy
 
 	// MutationRetries is how many times to re-send a rotate, split or merge
@@ -89,7 +90,7 @@ func (c *Client) mutationRetries() int {
 //
 // LUD-25 closed the hole at the other end: a service MUST now answer a
 // byte-identical rotate, split or merge with the success it already returned,
-// signature and all. So this client re-sends one whose answer was lost, on
+// any signatures included. So this client re-sends one whose answer was lost, on
 // purpose and bounded, and a lost answer usually resolves into a completed
 // mutation. See MutationRetries.
 //
@@ -261,7 +262,7 @@ func (c *Client) mutate(ctx context.Context, request Request, err error, kind Mu
 		body, err := c.do(ctx, request)
 		if err == nil {
 			var mutation Mutation
-			mutation, err = ParseMutation(body, request.NewSecrets, kind, c.Policy)
+			mutation, err = ParseMutation(body, request, kind, c.Policy)
 			if err == nil {
 				return mutation, nil
 			}
@@ -284,12 +285,19 @@ func (c *Client) MeltNote(ctx context.Context, callback, k1, pr string) (Mutatio
 
 // RotatedNote is a note this wallet now holds, whose secret the service has
 // never seen.
+//
+// Signature is empty from a mint following the current draft: the note is a
+// plain one, keyed by a hash, and LUD-25 Part 2 certifies cp1 notes only. A
+// mint that predates that rewrite still gives the old Part 1 signature. To
+// hold a note a recipient can check offline, rotate into a cp1 key with
+// RotateNoteWithHash.
 type RotatedNote struct {
 	K1        string
 	Signature string
 }
 
-// SplitNotes are the two notes a split produced.
+// SplitNotes are the two notes a split produced. Both are plain notes, so each
+// signature is present or empty on the same terms as RotatedNote's.
 type SplitNotes struct {
 	K1              string
 	Change          string
@@ -361,6 +369,10 @@ func (c *Client) MergeNotes(ctx context.Context, callback string, k1s []string) 
 // cp1s, mixed freely. Retried exactly as RotateNote is. There are no NewSecrets
 // on any error: the caller already holds whatever the outputs belong to, and
 // must have persisted it - with the index it came from - before calling.
+//
+// A cp1 output that comes back without its cs1 is an UnverifiableError,
+// whatever the Policy says: the note exists at the caller's key, but nobody
+// can check it offline, which is the reason to hold a cp1 note at all.
 
 // RotateNoteWithHash burns k1 and mints a note of the same value to h.
 func (c *Client) RotateNoteWithHash(ctx context.Context, callback, k1, h string) (Mutation, error) {

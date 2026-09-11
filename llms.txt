@@ -12,7 +12,8 @@ idempotent request sent on a REUSED connection, and a client with no Transport
 uses the process-wide http.DefaultTransport pool.
 
 LUD-25 closed this at the service end: a service MUST answer a byte-identical
-retried rotate/split/merge with the success it already returned, sig and all.
+retried rotate/split/merge with the success it already returned, sig and sig2
+included where it gave any.
 So Client re-sends a mutation whose answer was lost, on purpose and bounded
 (Client.MutationRetries; 0 means the default of one extra attempt, negative
 turns it off), and a dropped connection usually resolves into a completed
@@ -26,16 +27,23 @@ counts is not the same as an invisible one it does not, and a service that has
 not caught up still answers the second attempt as already spent. A
 caller-supplied *http.Client SHOULD do the same.
 
-## CRITICAL: offline verification is mandatory
+## CRITICAL: only cp1 notes are certified
 
-A service MUST publish mintPubkey on every withdrawRequest and MUST return sig
-(and sig2 on a split) from every rotate/split/merge. ParseNoteInfo refuses a
-response with no valid mintPubkey; ParseMutation returns *UnverifiableError for
-a confirmed-but-unsigned mutation. That error means the mutation LANDED, so the
-note is REAL - persist NewSecrets(err) before anything else.
+LUD-25 Part 2 certifies cp1 notes only. A rotate/split/merge to a plain hash
+output comes back as a bare {"status":"OK"}: Signature is empty, and that is
+the spec, not a fault. A signature a mint still gives over a hash is passed
+through for the caller to verify.
 
-Policy{AllowUnsignedNotes: true} opts out, for a service predating the
-requirement. The zero Policy is the strict one.
+A cp1 output (sent as p1, or p2 for a split's change) is owed its cs1 in sig
+(sig2 for the change) ALWAYS, whatever the Policy. Without it ParseMutation
+returns *UnverifiableError. That error means the mutation LANDED, so the note
+is REAL - persist NewSecrets(err) before anything else (empty from the
+*WithHash calls, where the caller named the output). ParseNoteInfo still
+refuses a withdrawRequest with no valid mintPubkey.
+
+The zero Policy is the default. Policy{RequireSignatures: true} also demands
+the old Part 1 signature over a hash output. Policy{AllowMissingMintPubkey:
+true} admits a Part 1-only mint with no mintPubkey. Nothing waives a cp1's cs1.
 
 ## API
 
@@ -112,8 +120,11 @@ DecodeBolt11AmountMsat, IsBolt11Invoice, SameInvoice.
 No-I/O protocol layer: RotateRequest / SplitRequest / MergeRequest /
 MeltRequest / NoteInfoRequest / InvoiceRequest / VerifyRequest return
 Request{URL, NewSecrets}; ParseNoteInfo(body, queriedURL, Policy) /
-ParseMutation(body, newSecrets, MutationKind, Policy) / ParseInvoice /
+ParseMutation(body, request, MutationKind, Policy) / ParseInvoice /
 ParseVerify / ParsePayRequest / ParseMintAddress read the body.
+ParseMutation takes the Request back and reads which outputs were cp1 off its
+URL (p1/p2), so a Request{URL, NewSecrets} rebuilt from persisted fields keeps
+the rule.
 MutationKind is MutationMelt / MutationRotate / MutationSplit / MutationMerge
 and says what the response owes - a melt mints nothing and owes no signature.
 
@@ -126,14 +137,16 @@ errors.Is(err, ErrNotePending)     a melt is in flight - retry, NOT spent
 IsSpent(err)                       authoritative: already burned
 IsUnknownNote(err)                 service does not recognise it
 IsAmbiguous(err)                   outcome UNKNOWN - assume nothing
-IsUnverifiable(err)                the mutation LANDED unsigned. The note is
-                                   REAL; only its verifiability is missing
+IsUnverifiable(err)                the mutation LANDED, but a cp1 output came
+                                   back without its cs1 (or a hash unsigned,
+                                   under RequireSignatures). The note is REAL;
+                                   only its verifiability is missing
 NewSecrets(err)                    the secrets carried by ANY error that could
                                    describe a mutation the service applied:
                                    ambiguous, unverifiable, spent or unknown
 *ProtocolError                     a non-mutating response did not match the
                                    spec, incl. a withdrawRequest with no
-                                   mintPubkey
+                                   mintPubkey (unless AllowMissingMintPubkey)
 
 ## Rules
 
