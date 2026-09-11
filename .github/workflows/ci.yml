@@ -23,7 +23,7 @@ jobs:
       # vectors come from there too
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
       # pinned, so a new vector file lands here as a deliberate bump rather
       # than as a red build on a commit that changed nothing
       - uses: actions/checkout@v4
