@@ -1,7 +1,8 @@
 # Releasing lnurlcash-go
 
-Go modules need no registry upload or publishing secret. A signed repository
-tag is the release artefact, and the public module proxy indexes it on demand.
+Go modules need no registry upload or publishing secret. An immutable
+repository tag is the release artefact, and the public module proxy indexes it
+on demand.
 
 ## Rehearsal
 
