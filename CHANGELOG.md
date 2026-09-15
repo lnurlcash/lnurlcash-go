@@ -5,6 +5,30 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Reference address proofs and compact note URLs
+
+- Add `AddressProofDigest` and `SignAddressProof` for the reference mint's
+  signed register/update/unregister flow, using the address branch's index-0
+  key and binding the proof to both action and normalised username.
+- Read the declared amount from an amount-bearing `cs1` when no separate
+  `amount` exists, and omit that duplicate parameter when rebuilding a URL
+  carrying a current certificate.
+- Grade both behaviours against `lnurlcash-conformance` 0.11.0 vectors.
+
+### Amount-bearing mint certificates
+
+- Add `EncodeCs1WithAmount`, `DecodeCs1WithAmount` and `IsCs1WithAmount` for
+  the current wire format, whose human-readable prefix carries the amount with
+  BOLT 11 amount rules. `DecodeCs1WithAmount` returns `Cs1` with both amount
+  and signature.
+- Keep `EncodeCs1`, `DecodeCs1` and `IsCs1` unchanged for legacy fixed-prefix
+  certificates. Add `DecodeAnyCs1` and `IsAnyCs1` for migrations accepting
+  both forms.
+- Signature verification accepts both formats, matching the reference kit;
+  callers can decode and compare the carried amount separately when needed.
+  Current encoding rejects negative amounts.
+- Grade the current format against `lnurlcash-conformance` 0.11.0 vectors.
+
 ### Amounts are read exactly
 
 - An informational GET whose `maxWithdrawable` or `minWithdrawable` is not a
@@ -18,19 +42,17 @@ carry breaking changes; pin an exact version.
   case, through the `Client` against a local server, including the request it
   sends: `sig` stays behind and `k1` goes out unchanged.
 
-### A plain note is unsigned
+### No-signer legacy compatibility
 
-LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing a mint
-could attest to without disclosing the secret. The reference mint and moneyer
-now answer a rotate, split or merge to a hash output with a bare
-`{"status":"OK"}`, and under the old default this package refused every one
-of those. It follows lnurlcash-kit 0.13.0.
+The reference mint signs a legacy hash output with a raw Part 1 signature when
+a signer is available and may omit it in no-signer mode. The committed
+TypeScript reference wallet requires it; this package keeps a tolerant default
+and exposes the strict behaviour as policy.
 
-- `Policy.RequireSignatures` is now a field, and false by default. A hash
-  output that comes back unsigned is the spec, not a fault: `Signature` (and
-  `ChangeSignature`) is empty, and no `*UnverifiableError` is raised. Set it
-  true to keep demanding the old Part 1 signature over the hash. A signature
-  that is present is passed through as before, for the caller to verify.
+- `Policy.RequireSignatures` is now a field, and false by default. In
+  no-signer mode `Signature` (and `ChangeSignature`) is empty and no
+  `*UnverifiableError` is raised. Set it true to match the strict reference
+  wallet. A signature that is present is passed through for verification.
 - A `cp1` output is owed its `cs1` certificate whatever the `Policy` says. A
   rotate, split or merge naming one (`p1`, or `p2` for a split's change) that
   comes back without `sig` (or `sig2`) returns `*UnverifiableError`, carrying
@@ -54,9 +76,9 @@ of those. It follows lnurlcash-kit 0.13.0.
   own secrets, to grade which outcomes carry them out. CI's conformance
   checkout moves to v0.10.0.
 
-If you relied on the default to refuse unsigned plain notes, set
-`RequireSignatures: true`. If you only ever wanted verifiable notes, hold
-`cp1` notes, the only kind the spec makes verifiable.
+If you relied on the default to refuse unsigned legacy outputs, set
+`RequireSignatures: true`. For an amount-bearing certificate, hold `cp1`
+notes.
 
 ### LUD-25 Part 2: notes keyed by a public key
 
@@ -156,8 +178,9 @@ and the adversarial mock mint.
 certifies `cp1` notes only: a service MUST return a `cs1` for every `cp1`
 output a rotate, split or merge mints, and `ParseMutation` returns
 `*UnverifiableError` when one comes back without it, whatever the `Policy`
-says. A plain hash output is unsigned by design, and passes unsigned unless
-`Policy{RequireSignatures: true}` asks for the old Part 1 signature.
+says. A legacy hash output may be unsigned in no-signer mode and passes under
+the tolerant default, unless `Policy{RequireSignatures: true}` asks for the
+raw Part 1 signature.
 `ParseNoteInfo` refuses a `withdrawRequest` publishing no `mintPubkey`, or one
 that is not a 33-byte compressed secp256k1 key, unless
 `Policy{AllowMissingMintPubkey: true}`; that field is named for what it

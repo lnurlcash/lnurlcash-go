@@ -286,11 +286,9 @@ func (c *Client) MeltNote(ctx context.Context, callback, k1, pr string) (Mutatio
 // RotatedNote is a note this wallet now holds, whose secret the service has
 // never seen.
 //
-// Signature is empty from a mint following the current draft: the note is a
-// plain one, keyed by a hash, and LUD-25 Part 2 certifies cp1 notes only. A
-// mint that predates that rewrite still gives the old Part 1 signature. To
-// hold a note a recipient can check offline, rotate into a cp1 key with
-// RotateNoteWithHash.
+// Signature is empty when a mint has no signer. The reference mint otherwise
+// returns its raw Part 1 signature for this legacy hash output. To hold an
+// amount-bearing certificate, rotate into a cp1 key with RotateNoteWithHash.
 type RotatedNote struct {
 	K1        string
 	Signature string

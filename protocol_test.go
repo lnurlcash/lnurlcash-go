@@ -536,11 +536,9 @@ func TestFindsTheExperimentalMintAddress(t *testing.T) {
 
 // ---- what a mutation is owed ----
 
-// A plain note is unsigned by design since LUD-25's Part 2 rewrite: a hash has
-// nothing a mint could attest to without disclosing the secret. A mint that
-// answers a rotate with a bare OK is following the spec, and the note comes
-// back with no signature - which is exactly what it is.
-func TestAnUnsignedPlainRotateIsOKByDefault(t *testing.T) {
+// The tolerant default preserves outputs from a reference mint running with
+// no signer. Strict reference-wallet parity is tested below.
+func TestANoSignerLegacyMintIsToleratedByDefault(t *testing.T) {
 	mint := startMint(t, "--signatures=false")
 	client := lnurlcash.NewClient()
 	k1 := secret(30)
@@ -560,7 +558,7 @@ func TestAnUnsignedPlainRotateIsOKByDefault(t *testing.T) {
 	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
 		t.Fatalf("rotated note is %s", state)
 	}
-	// and a split, whose two plain outputs are owed nothing either
+	// and a split whose two legacy outputs likewise have no available proof
 	split, err := client.SplitNote(ctx(t), info.Callback, []string{rotated.K1}, 5000)
 	if err != nil {
 		t.Fatalf("an unsigned plain split was refused: %v", err)
@@ -570,8 +568,8 @@ func TestAnUnsignedPlainRotateIsOKByDefault(t *testing.T) {
 	}
 }
 
-// A caller who still wants the old Part 1 signature over the hash can ask for
-// it. The refusal has to be the loud kind - but the rotate LANDED, and the
+// A caller matching the committed reference wallet asks for the raw Part 1
+// signature over the hash. The refusal has to be the loud kind - but the rotate LANDED, and the
 // fresh secret is the only key to the note it minted, so the error carries it
 // out. Refusing without it would be this package destroying real money to make
 // a point about a signature.

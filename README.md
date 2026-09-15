@@ -55,13 +55,11 @@ has not caught up still answers the second attempt as already spent, and a
 fresh connection per request is not a cost worth weighing against leaving that
 to chance. **If you supply your own `*http.Client`, do the same.**
 
-## Only a cp1 note is certified
+## Legacy signatures and cp1 certificates
 
-LUD-25 Part 2 certifies `cp1` notes only. A plain hash has nothing a mint could
-attest to without disclosing the secret, so a rotate, split or merge to a hash
-output comes back as a bare `{"status":"OK"}`, and its `Signature` is empty.
-That is the spec, not a fault. A mint that predates the rewrite may still give
-the old Part 1 signature over the hash; it is passed through for you to verify.
+The reference mint returns a raw Part 1 signature for a legacy hash output
+when a signer is available, and may omit it in no-signer mode. This package
+accepts that omission by default and passes through any signature received.
 
 A `cp1` output is owed its `cs1` certificate, always, and no `Policy` waives
 it. A mutation to one that the service confirms without it returns
@@ -75,8 +73,8 @@ the output, so you already hold what spends it.
 
 The zero `Policy` is the default. Two fields move it:
 
-- `RequireSignatures: true` also demands the old Part 1 signature over a hash
-  output, for a caller that wants the pre-rewrite behaviour back.
+- `RequireSignatures: true` demands the raw Part 1 signature over a hash
+  output, matching the committed reference wallet.
 - `AllowMissingMintPubkey: true` admits a Part 1-only mint that publishes no
   `mintPubkey`. Nothing it issues can then be verified offline.
 
@@ -222,10 +220,11 @@ under.
 A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`; the mint
 only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, a
 recoverable signature by `sk` over the fixed message `LNURLcash`, and the mint
-recovers `pk` from it. The mint's certificate, `cs1…`, is the same signature
-Part 1 mints gave over a hash, over `hex(pk)` instead, so a recipient can check
-a note offline with nothing but its `ck1` and `cs1`. A `cp1` note is the only
-kind the spec certifies.
+recovers `pk` from it. The mint's certificate, `cs1…`, carries the note amount
+in its prefix using BOLT 11 amount rules and contains the signature over
+`LNURLcash:<amount_msat>:<hex(pk)>`, so a recipient can recover the claimed
+amount and check the note offline. A `cp1` note is the only kind the spec
+certifies.
 
 ```go
 root, _ := lnurlcash.DeriveCashRoot(seed)
@@ -239,7 +238,21 @@ sig, _ := lnurlcash.SignNoteOwnership(sk)
 ck1 := lnurlcash.EncodeCk1(sig)                                     // the bearer secret
 
 lnurlcash.VerifyNoteSignature(ck1, amountMsat, cs1, mintPubkey)     // offline
+certificate, _ := lnurlcash.DecodeCs1WithAmount(cs1)                // amount + signature
 ```
+
+`EncodeCs1WithAmount`, `DecodeCs1WithAmount` and `IsCs1WithAmount`
+are the current wire API. The fixed-prefix `EncodeCs1`, `DecodeCs1` and
+`IsCs1` remain for legacy notes; `DecodeAnyCs1` and `IsAnyCs1` accept either
+form during migration. Verification accepts both forms, matching the reference
+kit; decode the certificate separately if the application needs to compare its
+carried amount with another value.
+
+Reference-mint address management proves control with the address branch's
+index-0 private key. `SignAddressProof(sk0, action, username)` returns the raw
+`r || s || recovery-id` proof over `LNURLcash:<action>:<username>`; action is
+`register` or `unregister`, and the username must be normalised exactly as it
+is sent to the service.
 
 A `ck1` goes anywhere a `k1` does: a note URL, `FetchNoteInfo`, rotate, split,
 merge and melt. A `cp1` goes anywhere an output does: `RequestMintInvoiceWithHash`

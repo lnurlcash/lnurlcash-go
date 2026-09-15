@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 )
 
@@ -32,6 +33,37 @@ import (
 // either kind of k1 and names the note by NoteIDOf.
 
 const lightningSignedMessagePrefix = "Lightning Signed Message:"
+
+// AddressProofDigest returns the action- and username-bound digest used to
+// prove control of a registered address's index-0 branch key. The caller must
+// use the same normalised username it sends to the service.
+func AddressProofDigest(action, username string) ([]byte, error) {
+	if action != "register" && action != "unregister" {
+		return nil, &ProtocolError{Detail: "an address proof action is register or unregister"}
+	}
+	inner := sha256.Sum256([]byte(lightningSignedMessagePrefix + "LNURLcash:" + action + ":" + username))
+	outer := sha256.Sum256(inner[:])
+	return outer[:], nil
+}
+
+// SignAddressProof signs a register/update or unregister proof with the
+// branch's index-0 private key. The returned bytes use the reference wire
+// layout r || s || recovery-id.
+func SignAddressProof(indexZeroSecretKey [32]byte, action, username string) ([65]byte, error) {
+	var out [65]byte
+	var key btcec.ModNScalar
+	if key.SetBytes(&indexZeroSecretKey) != 0 || key.IsZero() {
+		return out, &ProtocolError{Detail: "an index-zero secret key is a 32-byte scalar in [1, n)"}
+	}
+	digest, err := AddressProofDigest(action, username)
+	if err != nil {
+		return out, err
+	}
+	compact := ecdsa.SignCompact(btcec.PrivKeyFromScalar(&key), digest, true)
+	copy(out[:64], compact[1:])
+	out[64] = compact[0] - compactHeaderCompressed
+	return out, nil
+}
 
 // NoteSignatureMessage returns the message a note's signature commits to. k1
 // is a Part 1 secret or a Part 2 ck1.
@@ -70,8 +102,9 @@ func NoteSignatureDigestForHash(h string, amountMsat int64) []byte {
 // VerifyNoteSignature recovers the signer's pubkey and checks it against
 // mintPubkeyHex.
 //
-// k1 is a Part 1 secret or a Part 2 ck1. signature is 65 bytes of hex, or a
-// Part 2 cs1 carrying the same 65 bytes.
+// k1 is a Part 1 secret or a Part 2 ck1. signature is 65 bytes of hex, a
+// current amount-bearing cs1, or a legacy fixed-prefix cs1. Callers can decode
+// the carried amount separately when they need it.
 //
 // The signature is 65 bytes, but which end carries the recovery id varies by
 // implementation: LUD-25 calls for r || s || recovery_id, the layout raw
@@ -132,10 +165,9 @@ func VerifyNoteSignatureHash(h string, amountMsat int64, signature, mintPubkeyHe
 	return false
 }
 
-// signatureBytes reads a note signature in either spelling: a Part 2 cs1, or
-// the 65 bytes of hex a Part 1 note has always carried.
+// signatureBytes reads a note signature in any supported spelling.
 func signatureBytes(value string) ([]byte, bool) {
-	if certificate, err := DecodeCs1(value); err == nil {
+	if certificate, err := DecodeAnyCs1(value); err == nil {
 		return certificate[:], true
 	}
 	raw, err := hex.DecodeString(strings.TrimSpace(value))

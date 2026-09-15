@@ -98,6 +98,42 @@ func TestSignatureVectors(t *testing.T) {
 	}
 }
 
+func TestAddressProofVectors(t *testing.T) {
+	vectors := loadVectors(t, "part2.json")
+	var proofs []struct {
+		Action             string `json:"action"`
+		Username           string `json:"username"`
+		IndexZeroSecretKey string `json:"indexZeroSecretKey"`
+		Digest             string `json:"digest"`
+		Signature          string `json:"signature"`
+	}
+	unmarshalInto(t, vectors["addressProofs"], &proofs)
+	if len(proofs) == 0 {
+		t.Fatal("part2.json has no address proof vectors")
+	}
+	for _, proof := range proofs {
+		t.Run(proof.Action+"/"+proof.Username, func(t *testing.T) {
+			digest, err := lnurlcash.AddressProofDigest(proof.Action, proof.Username)
+			if err != nil {
+				t.Fatalf("digest: %v", err)
+			}
+			if got := hex.EncodeToString(digest); got != proof.Digest {
+				t.Errorf("digest = %s, want %s", got, proof.Digest)
+			}
+			signature, err := lnurlcash.SignAddressProof(hex32(t, proof.IndexZeroSecretKey), proof.Action, proof.Username)
+			if err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+			if got := hex.EncodeToString(signature[:]); got != proof.Signature {
+				t.Errorf("signature = %s, want %s", got, proof.Signature)
+			}
+		})
+	}
+	if _, err := lnurlcash.AddressProofDigest("delete", "alice"); err == nil {
+		t.Fatal("accepted an address proof action outside register/unregister")
+	}
+}
+
 func TestBech32Vectors(t *testing.T) {
 	vectors := loadVectors(t, "bech32.json")
 	var encode []struct {
@@ -795,20 +831,31 @@ type part2Vectors struct {
 	Spec        string `json:"spec"`
 	Description string `json:"description"`
 	Conventions struct {
-		AddressBranch      string `json:"addressBranch"`
-		HashingKey         string `json:"hashingKey"`
-		SpecTextSays       string `json:"specTextSays"`
-		NoteTweak          string `json:"noteTweak"`
-		IndexWidth         string `json:"indexWidth"`
-		OwnershipMessage   string `json:"ownershipMessage"`
-		OwnershipDigest    string `json:"ownershipDigest"`
-		SignatureLayout    string `json:"signatureLayout"`
-		CertificateMessage string `json:"certificateMessage"`
+		AddressBranch       string `json:"addressBranch"`
+		HashingKey          string `json:"hashingKey"`
+		SpecTextSays        string `json:"specTextSays"`
+		NoteTweak           string `json:"noteTweak"`
+		IndexWidth          string `json:"indexWidth"`
+		OwnershipMessage    string `json:"ownershipMessage"`
+		OwnershipDigest     string `json:"ownershipDigest"`
+		AddressProofMessage string `json:"addressProofMessage"`
+		SignatureLayout     string `json:"signatureLayout"`
+		CertificateMessage  string `json:"certificateMessage"`
+		CertificateHrp      string `json:"certificateHrp"`
 	} `json:"conventions"`
 	Mint struct {
 		PrivateKey string `json:"privateKey"`
 		MintPubkey string `json:"mintPubkey"`
 	} `json:"mint"`
+	AddressProofs []struct {
+		Action             string `json:"action"`
+		Username           string `json:"username"`
+		Message            string `json:"message"`
+		Digest             string `json:"digest"`
+		IndexZeroSecretKey string `json:"indexZeroSecretKey"`
+		IndexZeroPubkey    string `json:"indexZeroPubkey"`
+		Signature          string `json:"signature"`
+	} `json:"addressProofs"`
 	Branches []struct {
 		Mnemonic      string      `json:"mnemonic"`
 		SeedHex       string      `json:"seedHex"`
@@ -1001,6 +1048,9 @@ func TestPart2Vectors(t *testing.T) {
 	if conventions.OwnershipMessage != "LNURLcash" || conventions.CertificateMessage != "LNURLcash:<amount_msat>:<hex(pk)>" {
 		t.Fatalf("the vectors sign %q and certify %q", conventions.OwnershipMessage, conventions.CertificateMessage)
 	}
+	if conventions.AddressProofMessage != "LNURLcash:<register|unregister>:<username>" {
+		t.Fatalf("the vectors describe an unknown address proof message %q", conventions.AddressProofMessage)
+	}
 	inner := sha256.Sum256([]byte("Lightning Signed Message:" + conventions.OwnershipMessage))
 	ownershipDigest := sha256.Sum256(inner[:])
 	if got := hex.EncodeToString(ownershipDigest[:]); got != conventions.OwnershipDigest {
@@ -1113,6 +1163,9 @@ func TestPart2Vectors(t *testing.T) {
 	if len(vectors.Certificates) == 0 {
 		t.Fatal("no certificates")
 	}
+	if vectors.Conventions.CertificateHrp != "cs || BOLT11_amount_suffix(amount_msat)" {
+		t.Fatalf("certificateHrp = %q", vectors.Conventions.CertificateHrp)
+	}
 	for _, certificate := range vectors.Certificates {
 		t.Run(fmt.Sprintf("certificate for %d msat", certificate.AmountMsat), func(t *testing.T) {
 			if got := lnurlcash.NoteSignatureMessageForHash(certificate.NotePubkey, certificate.AmountMsat); got != certificate.Message {
@@ -1125,15 +1178,29 @@ func TestPart2Vectors(t *testing.T) {
 
 			signature := hex65(t, certificate.Signature)
 			requireLayout(t, signature)
-			if got := lnurlcash.EncodeCs1(signature); got != certificate.Cs1 {
+			got, err := lnurlcash.EncodeCs1WithAmount(certificate.AmountMsat, signature)
+			if err != nil || got != certificate.Cs1 {
 				t.Errorf("cs1 = %s, want %s", got, certificate.Cs1)
 			}
-			decoded, err := lnurlcash.DecodeCs1(certificate.Cs1)
-			if err != nil || decoded != signature {
+			decoded, err := lnurlcash.DecodeCs1WithAmount(certificate.Cs1)
+			if err != nil || decoded.AmountMsat != certificate.AmountMsat || decoded.Signature != signature {
 				t.Fatalf("cs1 does not decode to the signature: %v", err)
 			}
+			if lnurlcash.IsCs1(certificate.Cs1) || !lnurlcash.IsCs1WithAmount(certificate.Cs1) {
+				t.Error("a current cs1 was mistaken for a legacy certificate")
+			}
+			if any, err := lnurlcash.DecodeAnyCs1(certificate.Cs1); err != nil || any != signature || !lnurlcash.IsAnyCs1(certificate.Cs1) {
+				t.Errorf("the migration API did not accept the current certificate: %v", err)
+			}
+			legacy := lnurlcash.EncodeCs1(signature)
+			if old, err := lnurlcash.DecodeCs1(legacy); err != nil || old != signature || !lnurlcash.IsCs1(legacy) {
+				t.Errorf("the legacy certificate stopped working: %v", err)
+			}
+			if _, err := lnurlcash.DecodeCs1WithAmount(legacy); err == nil || lnurlcash.IsCs1WithAmount(legacy) {
+				t.Error("a legacy cs1 was assigned an amount it does not carry")
+			}
 			// the cs1 recovers to the mint's key, over the vector's own digest
-			if got := recoverCompressed(t, decoded, hexBytes(t, certificate.Digest, 32)); got != mintPubkey {
+			if got := recoverCompressed(t, decoded.Signature, hexBytes(t, certificate.Digest, 32)); got != mintPubkey {
 				t.Errorf("cs1 recovers to %s, want the mint's %s", got, mintPubkey)
 			}
 			for _, spelling := range []string{certificate.Signature, certificate.Cs1} {
@@ -1166,14 +1233,17 @@ func TestPart2Vectors(t *testing.T) {
 	decoders := map[string]func(string) (string, error){
 		"cp1": func(v string) (string, error) { b, err := lnurlcash.DecodeCp1(v); return hex.EncodeToString(b[:]), err },
 		"ck1": func(v string) (string, error) { b, err := lnurlcash.DecodeCk1(v); return hex.EncodeToString(b[:]), err },
-		"cs1": func(v string) (string, error) { b, err := lnurlcash.DecodeCs1(v); return hex.EncodeToString(b[:]), err },
+		"cs1": func(v string) (string, error) {
+			c, err := lnurlcash.DecodeCs1WithAmount(v)
+			return hex.EncodeToString(c.Signature[:]), err
+		},
 		"cx1": func(v string) (string, error) {
 			c, err := lnurlcash.DecodeCx1(v)
 			return hex.EncodeToString(c.PubkeyXOnly[:]) + hex.EncodeToString(c.ChainCode[:]), err
 		},
 	}
 	checks := map[string]func(string) bool{
-		"cp1": lnurlcash.IsCp1, "ck1": lnurlcash.IsCk1, "cs1": lnurlcash.IsCs1, "cx1": lnurlcash.IsCx1,
+		"cp1": lnurlcash.IsCp1, "ck1": lnurlcash.IsCk1, "cs1": lnurlcash.IsCs1WithAmount, "cx1": lnurlcash.IsCx1,
 	}
 	for _, valid := range vectors.Valid {
 		decode, ok := decoders[valid.Type]

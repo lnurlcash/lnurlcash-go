@@ -147,9 +147,9 @@ func (e *AmbiguousError) Unwrap() error { return e.Cause }
 // conformance. Persist them, then decide whether to keep dealing with a mint
 // that issues notes nobody can check.
 //
-// Raised for a cp1 output whatever the Policy says. A plain hash output is
-// unsigned by design and only raises it when Policy.RequireSignatures asked
-// for the old Part 1 signature over the hash.
+// Raised for a cp1 output whatever the Policy says. A legacy hash output raises
+// it when Policy.RequireSignatures asked for the raw Part 1 signature and a
+// no-signer mint omitted it.
 type UnverifiableError struct {
 	Detail string
 	// NewSecrets, as AmbiguousError - and more important here, because the note
