@@ -297,10 +297,27 @@ func TestTellsTheFourEncodingsApart(t *testing.T) {
 		// a Part 1 secret is never mistaken for any of them
 		{secret(0x11), [4]bool{}},
 	} {
-		got := [4]bool{lnurlcash.IsCp1(c.value), lnurlcash.IsCk1(c.value), lnurlcash.IsCs1(c.value), lnurlcash.IsCx1(c.value)}
+		got := [4]bool{lnurlcash.IsCp1(c.value), lnurlcash.IsCk1(c.value), lnurlcash.IsCs1WithAmount(c.value), lnurlcash.IsCx1(c.value)}
 		if got != c.want {
 			t.Errorf("%.12s...: cp1/ck1/cs1/cx1 = %v, want %v", c.value, got, c.want)
 		}
+	}
+}
+
+func TestAmountBearingCs1Boundaries(t *testing.T) {
+	var signature [65]byte
+	for _, amount := range []int64{0, 1, 99, 100, 21_000, 1<<63 - 1} {
+		encoded, err := lnurlcash.EncodeCs1WithAmount(amount, signature)
+		if err != nil {
+			t.Fatalf("encode %d msat: %v", amount, err)
+		}
+		decoded, err := lnurlcash.DecodeCs1WithAmount(encoded)
+		if err != nil || decoded.AmountMsat != amount || decoded.Signature != signature {
+			t.Errorf("round trip %d msat = %+v (%v)", amount, decoded, err)
+		}
+	}
+	if _, err := lnurlcash.EncodeCs1WithAmount(-1, signature); err == nil {
+		t.Error("encoded a negative amount")
 	}
 }
 
@@ -497,7 +514,7 @@ func TestAnUncertifiedCp1OutputIsUnverifiableWhateverThePolicy(t *testing.T) {
 		}
 	}
 
-	// The same bare OK to a hash is a plain note, owed nothing.
+	// The tolerant policy preserves a legacy hash output from no-signer mode.
 	if _, err := lnurlcash.NewClient().RotateNoteWithHash(ctx(t), callback, part2.a.Ck1, hash); err != nil {
 		t.Errorf("an unsigned plain output was refused: %v", err)
 	}
@@ -584,6 +601,12 @@ func FuzzPart2Decoders(f *testing.F) {
 		}
 		if signature, err := lnurlcash.DecodeCs1(value); err == nil && lnurlcash.EncodeCs1(signature) != canonical {
 			t.Errorf("cs1 %q decodes to %x, which encodes differently", value, signature)
+		}
+		if certificate, err := lnurlcash.DecodeCs1WithAmount(value); err == nil {
+			encoded, encodeErr := lnurlcash.EncodeCs1WithAmount(certificate.AmountMsat, certificate.Signature)
+			if encodeErr != nil || encoded != canonical {
+				t.Errorf("amount-bearing cs1 %q encodes differently (%v)", value, encodeErr)
+			}
 		}
 		if branch, err := lnurlcash.DecodeCx1(value); err == nil && lnurlcash.EncodeCx1(branch.PubkeyXOnly, branch.ChainCode) != canonical {
 			t.Errorf("cx1 %q decodes to %+v, which encodes differently", value, branch)

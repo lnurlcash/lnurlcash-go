@@ -23,6 +23,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/btcsuite/btcd/btcutil/bech32"
@@ -118,11 +120,12 @@ func IsCk1(value string) bool {
 	return err == nil
 }
 
-// EncodeCs1 encodes a service's issuance certificate: the same 65-byte layout
-// as a ck1, signed by the mint over "LNURLcash:<amount_msat>:<hex(pk)>".
+// EncodeCs1 encodes a legacy fixed-prefix certificate. New code should use
+// EncodeCs1WithAmount. This function remains unchanged so old notes and
+// callers remain usable.
 func EncodeCs1(signature [65]byte) string { return encodeFixed("cs", signature[:]) }
 
-// DecodeCs1 reads a cs1 back to its signature.
+// DecodeCs1 reads only a legacy fixed-prefix cs1 back to its signature.
 func DecodeCs1(value string) ([65]byte, error) {
 	var out [65]byte
 	payload, err := decodeFixed("cs", value, len(out))
@@ -133,9 +136,143 @@ func DecodeCs1(value string) ([65]byte, error) {
 	return out, nil
 }
 
-// IsCs1 reports whether value is a well-formed cs1.
+// IsCs1 reports whether value is a well-formed legacy fixed-prefix cs1.
 func IsCs1(value string) bool {
 	_, err := DecodeCs1(value)
+	return err == nil
+}
+
+// Cs1 is a current amount-bearing mint certificate.
+type Cs1 struct {
+	AmountMsat int64
+	Signature  [65]byte
+}
+
+func encodeCs1AmountSuffix(amountMsat int64) string {
+	for _, unit := range []struct {
+		suffix string
+		msat   int64
+	}{
+		{"", 100_000_000_000},
+		{"m", 100_000_000},
+		{"u", 100_000},
+		{"n", 100},
+	} {
+		if amountMsat%unit.msat == 0 {
+			return strconv.FormatInt(amountMsat/unit.msat, 10) + unit.suffix
+		}
+	}
+	// One pico-BTC is 0.1 msat. Appending a zero avoids overflowing int64
+	// while rendering every amount that the package can represent.
+	return strconv.FormatInt(amountMsat, 10) + "0p"
+}
+
+func decodeCs1AmountSuffix(value string) (int64, bool) {
+	if value == "" {
+		return 0, false
+	}
+	digits, multiplier := value, byte(0)
+	last := value[len(value)-1]
+	if strings.ContainsRune("munp", rune(last)) {
+		digits, multiplier = value[:len(value)-1], last
+	}
+	if digits == "" {
+		return 0, false
+	}
+	for i := range len(digits) {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, false
+		}
+	}
+	n, ok := new(big.Int).SetString(digits, 10)
+	if !ok {
+		return 0, false
+	}
+	switch multiplier {
+	case 0:
+		n.Mul(n, big.NewInt(100_000_000_000))
+	case 'm':
+		n.Mul(n, big.NewInt(100_000_000))
+	case 'u':
+		n.Mul(n, big.NewInt(100_000))
+	case 'n':
+		n.Mul(n, big.NewInt(100))
+	case 'p':
+		quotient, remainder := new(big.Int), new(big.Int)
+		quotient.QuoRem(n, big.NewInt(10), remainder)
+		if remainder.Sign() != 0 {
+			return 0, false
+		}
+		n = quotient
+	}
+	if !n.IsInt64() {
+		return 0, false
+	}
+	return n.Int64(), true
+}
+
+// EncodeCs1WithAmount encodes a current certificate. Its human-readable
+// prefix is cs followed by the amount using BOLT 11 amount suffix rules; its
+// payload is the mint's 65-byte recoverable signature over that same amount
+// and the note key.
+func EncodeCs1WithAmount(amountMsat int64, signature [65]byte) (string, error) {
+	if amountMsat < 0 {
+		return "", fmt.Errorf("amountMsat must be non-negative")
+	}
+	return encodeFixed("cs"+encodeCs1AmountSuffix(amountMsat), signature[:]), nil
+}
+
+// DecodeCs1WithAmount reads a current certificate and the amount carried by
+// its prefix. It deliberately rejects the legacy fixed cs prefix, which has no
+// amount to return.
+func DecodeCs1WithAmount(value string) (Cs1, error) {
+	var out Cs1
+	invalid := func(why string) error {
+		return &ProtocolError{Detail: "not an amount-bearing cs1: " + why}
+	}
+	trimmed := strings.TrimSpace(value)
+	prefix, words, version, err := bech32.DecodeNoLimitWithVersion(trimmed)
+	switch {
+	case err != nil:
+		return out, invalid("not a well-formed bech32m string")
+	case version != bech32.VersionM:
+		return out, invalid("the checksum is bech32, not bech32m")
+	case !strings.HasPrefix(prefix, "cs"):
+		return out, invalid("the prefix does not start with cs")
+	}
+	amount, ok := decodeCs1AmountSuffix(strings.TrimPrefix(prefix, "cs"))
+	if !ok {
+		return out, invalid("the prefix carries no whole int64 msat amount")
+	}
+	payload, err := bech32.ConvertBits(words, 5, 8, false)
+	if err != nil {
+		return out, invalid("the padding is not zero")
+	}
+	if len(payload) != len(out.Signature) {
+		return out, invalid(fmt.Sprintf("the payload is %d bytes, not %d", len(payload), len(out.Signature)))
+	}
+	out.AmountMsat = amount
+	copy(out.Signature[:], payload)
+	return out, nil
+}
+
+// IsCs1WithAmount reports whether value is a current amount-bearing cs1.
+func IsCs1WithAmount(value string) bool {
+	_, err := DecodeCs1WithAmount(value)
+	return err == nil
+}
+
+// DecodeAnyCs1 reads the signature from either current or legacy form.
+func DecodeAnyCs1(value string) ([65]byte, error) {
+	if current, err := DecodeCs1WithAmount(value); err == nil {
+		return current.Signature, nil
+	}
+	return DecodeCs1(value)
+}
+
+// IsAnyCs1 reports whether value is either a current or legacy cs1.
+func IsAnyCs1(value string) bool {
+	_, err := DecodeAnyCs1(value)
 	return err == nil
 }
 

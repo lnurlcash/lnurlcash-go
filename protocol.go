@@ -39,16 +39,13 @@ type Request struct {
 //
 // LUD-25 Part 2 certifies cp1 notes only. A rotate, split or merge to a cp1
 // output owes that output its cs1 certificate, and this package always
-// insists on it: nothing here waives it, because a cp1 note nobody can check
-// offline has lost the one thing it is for. A plain hash output has nothing a
-// mint could attest to without disclosing the secret, so it comes back
-// unsigned by design, and that is the spec rather than a fault.
+// insists on it: nothing here waives it. A legacy hash output carries the raw
+// Part 1 signature when the reference mint has a signer, and may be unsigned
+// in its no-signer mode.
 type Policy struct {
-	// RequireSignatures also demands the old Part 1 signature over a plain
-	// hash output, as every mint that predates the Part 2 rewrite gave one.
-	// Off by default: a mint following the current draft answers a plain
-	// rotate with a bare {"status":"OK"}, and refusing that would be refusing
-	// the spec. lnurlcash-kit's requireSignatures.
+	// RequireSignatures demands the raw Part 1 signature over a legacy hash
+	// output, matching the committed reference wallet. Off by default to admit
+	// the reference mint's no-signer mode.
 	RequireSignatures bool
 
 	// AllowMissingMintPubkey admits a withdrawRequest that publishes no
@@ -107,7 +104,7 @@ type WithdrawInfo struct {
 	MinWithdrawableMsat int64
 	DefaultDescription  string
 	// MintPubkey is the key this service's note signatures verify against: a
-	// cp1 note's cs1, or the old Part 1 signature over a hash.
+	// cp1 note's cs1, or the raw Part 1 signature over a legacy hash.
 	//
 	// A conforming service always publishes it here. Only ever empty, or not
 	// a compressed key, when the caller's Policy set AllowMissingMintPubkey.
@@ -213,9 +210,8 @@ type InvoiceStatus struct {
 type Mutation struct {
 	// Signature is sig, over the output. For a cp1 output it is the cs1
 	// certificate, and never empty: ParseMutation refuses the answer without
-	// it. For a plain hash output it is empty from a mint following the
-	// current draft, and the old Part 1 signature from one that still gives
-	// it.
+	// it. For a legacy hash output it is the raw Part 1 signature, or empty
+	// only when a no-signer mint is accepted by policy.
 	Signature string
 	// ChangeSignature is sig2, the same for a split's change.
 	ChangeSignature string
@@ -693,7 +689,7 @@ func MergeRequest(callback string, k1s []string, newSecret string) (Request, err
 //
 // A confirmed rotate, split or merge that owes a signature and did not return
 // one is an UnverifiableError. A cp1 output always owes its cs1; a hash output
-// owes the old Part 1 signature only when the Policy asks for it. Which
+// requires the raw Part 1 signature when the Policy asks for it. Which
 // outputs were cp1 is read off request.URL - see certifiedOutputs.
 func ParseMutation(body []byte, request Request, kind MutationKind, policy Policy) (Mutation, error) {
 	newSecrets := request.NewSecrets
@@ -741,11 +737,10 @@ func ParseMutation(body []byte, request Request, kind MutationKind, policy Polic
 // without the signature its kind is owed, in output order so the error names
 // the one actually missing.
 //
-// A cp1 output is owed its cs1 whatever the Policy says. A hash output is a
-// plain note, unsigned by design, and is only refused for coming back unsigned
-// when the caller asked for the old Part 1 signature. A signature that is
-// present is passed through either way, for the caller to verify. A melt mints
-// nothing and owes nothing.
+// A cp1 output is owed its cs1 whatever the Policy says. A legacy hash uses a
+// raw Part 1 signature when available and is refused without one only when the
+// caller enabled strict reference-wallet parity. A signature that is present
+// is passed through either way. A melt mints nothing and owes nothing.
 //
 // The mutation has already landed by the time this is checked - status was OK
 // - so the refusal carries the caller's secrets out with it, or enforcing the

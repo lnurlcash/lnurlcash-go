@@ -27,12 +27,11 @@ counts is not the same as an invisible one it does not, and a service that has
 not caught up still answers the second attempt as already spent. A
 caller-supplied *http.Client SHOULD do the same.
 
-## CRITICAL: only cp1 notes are certified
+## CRITICAL: legacy signatures and cp1 certificates differ
 
-LUD-25 Part 2 certifies cp1 notes only. A rotate/split/merge to a plain hash
-output comes back as a bare {"status":"OK"}: Signature is empty, and that is
-the spec, not a fault. A signature a mint still gives over a hash is passed
-through for the caller to verify.
+The reference mint signs legacy hash outputs in raw Part 1 form when a signer
+is available and may omit the proof in no-signer mode. The tolerant default
+accepts omission; a received signature is passed through for verification.
 
 A cp1 output (sent as p1, or p2 for a split's change) is owed its cs1 in sig
 (sig2 for the change) ALWAYS, whatever the Policy. Without it ParseMutation
@@ -41,8 +40,8 @@ is REAL - persist NewSecrets(err) before anything else (empty from the
 *WithHash calls, where the caller named the output). ParseNoteInfo still
 refuses a withdrawRequest with no valid mintPubkey.
 
-The zero Policy is the default. Policy{RequireSignatures: true} also demands
-the old Part 1 signature over a hash output. Policy{AllowMissingMintPubkey:
+The zero Policy is the default. Policy{RequireSignatures: true} demands the
+raw Part 1 signature over a hash output, matching the committed reference wallet. Policy{AllowMissingMintPubkey:
 true} admits a Part 1-only mint with no mintPubkey. Nothing waives a cp1's cs1.
 
 ## API
@@ -95,9 +94,13 @@ DeriveNoteSecretKey(branchKey, chainCode, i) -> [32]byte  negates an odd branch
 SignNoteOwnership(sk) -> [65]byte  RFC6979, low-S, over fixed "LNURLcash",
   laid out r || s || recovery id (0..3)
 RecoverNoteOwnershipPubkey(sig) -> [32]byte
-EncodeCp1 / DecodeCp1 (32 bytes), Ck1 (65), Cs1 (65), Cx1 (64), IsCp1..IsCx1
+EncodeCp1 / DecodeCp1 (32 bytes), Ck1 (65), Cx1 (64), IsCp1/IsCk1/IsCx1
   bech32m, NO 90-char limit, all-uppercase ok; mixed case, a bech32 checksum,
   a wrong hrp or length, or non-zero padding are refused. Never panic
+EncodeCs1WithAmount / DecodeCs1WithAmount / IsCs1WithAmount
+  current certificate: Cs1{AmountMsat, Signature}; HRP is "cs" plus the
+  BOLT11 amount suffix. EncodeCs1 / DecodeCs1 / IsCs1 are LEGACY fixed-HRP.
+  DecodeAnyCs1 / IsAnyCs1 accept either during migration.
 NoteIDOf(k1) -> id  sha256(k1) for a secret, the recovered key for a ck1. One
   note has many valid ck1 strings: compare notes by this, NEVER by k1
 NoteLookupOf(k1) -> the hash, or the cp1 for a ck1; for FetchNoteInfoByHash
@@ -105,11 +108,15 @@ Wire: a ck1 goes wherever a k1 does; a cp1 wherever an output does.
   MintInvoiceRequestWithHash: cp1 as the comment alone (a hash: comment + h)
   *RequestWithHash: cp1 as p1/p2, a hash as h/h2, per value
   BuildNoteInfoURLByHash: cp1 as p, a hash as h
-VerifyNoteSignature takes a ck1 as k1 and a cs1 as the signature;
+VerifyNoteSignature takes a ck1 as k1 and either cs1 form as the signature;
+  decode the certificate separately when comparing its carried amount;
   VerifyNoteSignatureHash / NoteSignatureMessageForHash / DigestForHash take
   the note's id instead, for a watcher that has only the key
 DeriveNostrCashSeed(sk) / DeriveNostrAddressNode(sk, host)  EXTENSION, not
   LUD-25: seed = HMAC-SHA256(sk, "LNURLcash/nostr-seed"), then the path above
+AddressProofDigest(action, username) / SignAddressProof(indexZeroSK, action, username)
+  reference address register/update/unregister proof; raw r||s||recovery-id
+  exact message LNURLcash:<register|unregister>:<normalised username>
 
 Pure functions: VerifyNoteSignature, GenerateNoteSecret, HashK1, IsPreimage,
 ResolveNoteInput, ResolveMintInput, ResolveLnurlInput, IsAllowedServiceURL,

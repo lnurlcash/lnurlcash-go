@@ -25,7 +25,8 @@ func NoteK1(rawURL string) string {
 // Only a claim by whoever encoded it - a service ignores it at the
 // informational endpoint - so it is safe to display before contacting the
 // service but must not be trusted without either a matching signature or a
-// fresh online GET.
+// fresh online GET. When there is no separate amount parameter, a current
+// amount-bearing cs1 carries the same declaration in its prefix.
 func NoteDeclaredAmountMsat(rawURL string) (int64, bool) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -33,7 +34,11 @@ func NoteDeclaredAmountMsat(rawURL string) (int64, bool) {
 	}
 	raw := parsed.Query().Get("amount")
 	if raw == "" {
-		return 0, false
+		certificate, err := DecodeCs1WithAmount(parsed.Query().Get("sig"))
+		if err != nil {
+			return 0, false
+		}
+		return certificate.AmountMsat, true
 	}
 	amount, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
@@ -166,6 +171,7 @@ func rewriteNote(rawURL, k1 string, amountMsat int64, signature string, drop boo
 	// and a note URL's shape is user-visible, quoted in bug reports and
 	// compared by eye. Rebuild it in the order it arrived.
 	pairs := parseOrdered(parsed.RawQuery)
+	amountIsImplied := signature != "" && IsCs1WithAmount(signature)
 	out := make([][2]string, 0, len(pairs)+3)
 	sawK1, sawAmount, sawSig := false, false, false
 	for _, pair := range pairs {
@@ -177,8 +183,10 @@ func rewriteNote(rawURL, k1 string, amountMsat int64, signature string, drop boo
 			out = append(out, [2]string{"k1", k1})
 			sawK1 = true
 		case "amount":
-			out = append(out, [2]string{"amount", strconv.FormatInt(amountMsat, 10)})
-			sawAmount = true
+			if !amountIsImplied {
+				out = append(out, [2]string{"amount", strconv.FormatInt(amountMsat, 10)})
+				sawAmount = true
+			}
 		case "sig":
 			if signature != "" {
 				out = append(out, [2]string{"sig", signature})
@@ -191,7 +199,7 @@ func rewriteNote(rawURL, k1 string, amountMsat int64, signature string, drop boo
 	if !drop && !sawK1 {
 		out = append(out, [2]string{"k1", k1})
 	}
-	if !sawAmount {
+	if !sawAmount && !amountIsImplied {
 		out = append(out, [2]string{"amount", strconv.FormatInt(amountMsat, 10)})
 	}
 	if signature != "" && !sawSig {
