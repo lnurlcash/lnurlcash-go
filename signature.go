@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 )
 
 // LUD-25 offline verification.
@@ -28,29 +29,43 @@ import (
 // revealing what would let anyone spend it.
 //
 // A Part 2 note has no hash. Its certificate, the cs1, is the same signature
-// over hex(pk) in the hash's place, and the pk comes from the ck1 by recovery,
-// so checking a Part 2 note needs no network either. Everything below takes
+// over hex(pk) in the hash's place, and the pk is the verified key the ck1
+// embeds, so checking a Part 2 note needs no network either. Everything below takes
 // either kind of k1 and names the note by NoteIDOf.
 
 const lightningSignedMessagePrefix = "Lightning Signed Message:"
 
-// AddressProofDigest returns the action- and username-bound digest used to
-// prove control of a registered address's index-0 branch key. The caller must
-// use the same normalised username it sends to the service.
-func AddressProofDigest(action, username string) ([]byte, error) {
+// AddressProofMessage returns the action- and username-bound message used to
+// prove control of a registered address's index-0 branch key:
+// LNURLcash:<action>:<username>. The caller must use the same normalised
+// username it sends to the service.
+func AddressProofMessage(action, username string) (string, error) {
 	if action != "register" && action != "unregister" {
-		return nil, &ProtocolError{Detail: "an address proof action is register or unregister"}
+		return "", &ProtocolError{Detail: "an address proof action is register or unregister"}
 	}
-	inner := sha256.Sum256([]byte(lightningSignedMessagePrefix + "LNURLcash:" + action + ":" + username))
-	outer := sha256.Sum256(inner[:])
-	return outer[:], nil
+	return "LNURLcash:" + action + ":" + username, nil
+}
+
+// AddressProofDigest is AddressProofMessage hashed to the 32-byte digest that
+// is actually signed. username is variable-length, so the raw message would
+// otherwise only rarely land on the 32 bytes most Schnorr signers require -
+// the same reason ownership proofs are hashed (see SignNoteOwnership).
+func AddressProofDigest(action, username string) ([]byte, error) {
+	message, err := AddressProofMessage(action, username)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256([]byte(message))
+	return digest[:], nil
 }
 
 // SignAddressProof signs a register/update or unregister proof with the
-// branch's index-0 private key. The returned bytes use the reference wire
-// layout r || s || recovery-id.
-func SignAddressProof(indexZeroSecretKey [32]byte, action, username string) ([65]byte, error) {
-	var out [65]byte
+// branch's index-0 private key: a raw 64-byte BIP-340 signature over
+// AddressProofDigest, with all-zero auxiliary input. This is a fresh action a
+// wallet initiates itself, never a stored bearer secret read back later, so
+// unlike ownership proofs there is no older scheme to fall back to reading.
+func SignAddressProof(indexZeroSecretKey [32]byte, action, username string) ([64]byte, error) {
+	var out [64]byte
 	var key btcec.ModNScalar
 	if key.SetBytes(&indexZeroSecretKey) != 0 || key.IsZero() {
 		return out, &ProtocolError{Detail: "an index-zero secret key is a 32-byte scalar in [1, n)"}
@@ -59,9 +74,11 @@ func SignAddressProof(indexZeroSecretKey [32]byte, action, username string) ([65
 	if err != nil {
 		return out, err
 	}
-	compact := ecdsa.SignCompact(btcec.PrivKeyFromScalar(&key), digest, true)
-	copy(out[:64], compact[1:])
-	out[64] = compact[0] - compactHeaderCompressed
+	signature, err := schnorr.Sign(btcec.PrivKeyFromScalar(&key), digest, schnorr.CustomNonce([32]byte{}))
+	if err != nil {
+		return out, &ProtocolError{Detail: "could not sign the address proof message"}
+	}
+	copy(out[:], signature.Serialize())
 	return out, nil
 }
 

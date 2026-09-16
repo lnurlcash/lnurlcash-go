@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	lnurlcash "github.com/lnurlcash/lnurlcash-go"
@@ -103,6 +104,7 @@ func TestAddressProofVectors(t *testing.T) {
 	var proofs []struct {
 		Action             string `json:"action"`
 		Username           string `json:"username"`
+		Message            string `json:"message"`
 		IndexZeroSecretKey string `json:"indexZeroSecretKey"`
 		Digest             string `json:"digest"`
 		Signature          string `json:"signature"`
@@ -113,6 +115,10 @@ func TestAddressProofVectors(t *testing.T) {
 	}
 	for _, proof := range proofs {
 		t.Run(proof.Action+"/"+proof.Username, func(t *testing.T) {
+			message, err := lnurlcash.AddressProofMessage(proof.Action, proof.Username)
+			if err != nil || message != proof.Message {
+				t.Errorf("message = %q (%v), want %q", message, err, proof.Message)
+			}
 			digest, err := lnurlcash.AddressProofDigest(proof.Action, proof.Username)
 			if err != nil {
 				t.Fatalf("digest: %v", err)
@@ -129,8 +135,11 @@ func TestAddressProofVectors(t *testing.T) {
 			}
 		})
 	}
-	if _, err := lnurlcash.AddressProofDigest("delete", "alice"); err == nil {
+	if _, err := lnurlcash.AddressProofMessage("delete", "alice"); err == nil {
 		t.Fatal("accepted an address proof action outside register/unregister")
+	}
+	if _, err := lnurlcash.AddressProofDigest("delete", "alice"); err == nil {
+		t.Fatal("digested an address proof action outside register/unregister")
 	}
 }
 
@@ -644,9 +653,11 @@ func TestPayRequestVectors(t *testing.T) {
 
 // ---- derivation ----
 //
-// The two schemes a wallet may mint under. cash-derivation.json is the one
-// LUD-25 specifies and the one a new wallet uses; derivation.json is the
-// pre-spec HMAC scheme, kept because notes minted under it are still money.
+// cash-derivation.json grades LUD-25's m/139' walk down to a mint's domain
+// node, which is Part 2's address branch; derivation.json is the pre-spec HMAC
+// scheme, kept because notes minted under it are still money. The k1 and noteId
+// cash-derivation.json still carries belong to a deterministic Part 1 ladder
+// this package no longer provides: Part 1 secrets are plain randomness.
 //
 // A disagreement with either file is a wallet that cannot restore what another
 // implementation of the same seed phrase minted, which is the whole reason
@@ -732,30 +743,6 @@ func TestCashDerivationVectors(t *testing.T) {
 		if got := lnurlcash.CashNodeToHex(domainNode); got != testCase.DomainNode {
 			t.Errorf("%s: domain node = %s, want %s", testCase.Name, got, testCase.DomainNode)
 		}
-
-		secret, err := lnurlcash.DeriveCashSecret(root, testCase.Host, testCase.Index)
-		if err != nil {
-			t.Fatalf("%s: %v", testCase.Name, err)
-		}
-		if secret != testCase.K1 {
-			t.Errorf("%s: k1 = %s, want %s", testCase.Name, secret, testCase.K1)
-		}
-		// The hardware-signer path: given only this mint's subtree, with no
-		// seed and no elliptic curve, every note index still resolves.
-		fromNode, err := lnurlcash.CashSecretAt(domainNode, testCase.Index)
-		if err != nil {
-			t.Fatalf("%s: %v", testCase.Name, err)
-		}
-		if fromNode != testCase.K1 {
-			t.Errorf("%s: from the domain node alone = %s, want %s", testCase.Name, fromNode, testCase.K1)
-		}
-		id, err := lnurlcash.HashK1(secret)
-		if err != nil {
-			t.Fatalf("%s: %v", testCase.Name, err)
-		}
-		if id != testCase.NoteID {
-			t.Errorf("%s: noteId = %s, want %s", testCase.Name, id, testCase.NoteID)
-		}
 	}
 }
 
@@ -793,12 +780,13 @@ func TestLegacyDerivationVectors(t *testing.T) {
 
 // ---- LUD-25 Part 2 ----
 //
-// part2.json: notes keyed by a public key and spent by a recoverable
-// signature. Every field of every branch, note and certificate is graded, and
-// each value from the side that would actually compute it: note keys from the
-// cx1 alone, as a watching mint does; secret keys from the address node, as
-// the holder does; each ck1 by signing again, since RFC6979 must reproduce it
-// byte for byte; and each ck1 and cs1 by recovering the key inside it.
+// part2.json: notes keyed by a public key and spent by a BIP-340 Schnorr
+// proof. Every field of every branch, note and certificate is graded, and each
+// value from the side that would actually compute it: note keys from the cx1
+// alone, as a watching mint does; secret keys from the address node, as the
+// holder does; each ck1 by signing again, since zero auxiliary input must
+// reproduce it byte for byte; each ck1 by verifying the key inside it; and
+// each cs1 by recovering the mint key from it.
 //
 // Both files are decoded strictly. A field these tests do not know is a field
 // nobody is grading, so a vector that gains one fails here until it is.
@@ -808,7 +796,7 @@ func loadVectorsStrict(t *testing.T, name string, target any) {
 	path := filepath.Join(vectorsDir(t), name)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Skipf("conformance vectors not found at %s - check out lnurlcash-conformance v0.10.0 or later alongside this repo, or set LNURLCASH_CONFORMANCE", path)
+		t.Skipf("conformance vectors not found at %s - check out lnurlcash-conformance v0.13.0 or later alongside this repo, or set LNURLCASH_CONFORMANCE", path)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -831,17 +819,19 @@ type part2Vectors struct {
 	Spec        string `json:"spec"`
 	Description string `json:"description"`
 	Conventions struct {
-		AddressBranch       string `json:"addressBranch"`
-		HashingKey          string `json:"hashingKey"`
-		SpecTextSays        string `json:"specTextSays"`
-		NoteTweak           string `json:"noteTweak"`
-		IndexWidth          string `json:"indexWidth"`
-		OwnershipMessage    string `json:"ownershipMessage"`
-		OwnershipDigest     string `json:"ownershipDigest"`
-		AddressProofMessage string `json:"addressProofMessage"`
-		SignatureLayout     string `json:"signatureLayout"`
-		CertificateMessage  string `json:"certificateMessage"`
-		CertificateHrp      string `json:"certificateHrp"`
+		AddressBranch               string `json:"addressBranch"`
+		HashingKey                  string `json:"hashingKey"`
+		SpecTextSays                string `json:"specTextSays"`
+		NoteTweak                   string `json:"noteTweak"`
+		IndexWidth                  string `json:"indexWidth"`
+		OwnershipMessage            string `json:"ownershipMessage"`
+		OwnershipMessageEncoding    string `json:"ownershipMessageEncoding"`
+		OwnershipSignature          string `json:"ownershipSignature"`
+		Ck1Payload                  string `json:"ck1Payload"`
+		AddressProofMessage         string `json:"addressProofMessage"`
+		AddressProofMessageEncoding string `json:"addressProofMessageEncoding"`
+		CertificateMessage          string `json:"certificateMessage"`
+		CertificateHrp              string `json:"certificateHrp"`
 	} `json:"conventions"`
 	Mint struct {
 		PrivateKey string `json:"privateKey"`
@@ -937,8 +927,8 @@ func recoverCompressed(t *testing.T, signature [65]byte, digest []byte) string {
 	return hex.EncodeToString(pubkey.SerializeCompressed())
 }
 
-// requireLayout checks the conventions' "r || s || recovery id (0..3),
-// low-S" against a signature's own bytes.
+// requireLayout checks a certificate's "r || s || recovery id (0..3), low-S"
+// against the signature's own bytes.
 func requireLayout(t *testing.T, signature [65]byte) {
 	t.Helper()
 	if signature[64] > 3 {
@@ -995,32 +985,45 @@ func gradeNote(t *testing.T, node lnurlcash.CashNode, watched lnurlcash.Cx1, not
 		t.Errorf("cp1 does not decode to the note pubkey: %v", err)
 	}
 
-	// RFC6979: signing again reproduces the ck1 byte for byte
-	signature, err := lnurlcash.SignNoteOwnership(secretKey)
+	// fixed zero auxiliary input: signing again reproduces the ck1 byte for
+	// byte, which is what lets seed recovery rebuild it
+	payload, err := lnurlcash.SignNoteOwnership(secretKey)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
+	if got := hex.EncodeToString(payload[:32]); got != note.NotePubkey {
+		t.Errorf("ownership payload key = %s, want %s", got, note.NotePubkey)
+	}
 	if note.OwnershipSignature != "" {
-		if got := hex.EncodeToString(signature[:]); got != note.OwnershipSignature {
+		if got := hex.EncodeToString(payload[32:]); got != note.OwnershipSignature {
 			t.Errorf("ownership signature = %s, want %s", got, note.OwnershipSignature)
 		}
-		requireLayout(t, hex65(t, note.OwnershipSignature))
+		// independently of the package: a BIP-340 signature over sha256("LNURLcash")
+		digest := sha256.Sum256([]byte("LNURLcash"))
+		pubkey, err := schnorr.ParsePubKey(hexBytes(t, note.NotePubkey, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		signature, err := schnorr.ParseSignature(hexBytes(t, note.OwnershipSignature, 64))
+		if err != nil || !signature.Verify(digest[:], pubkey) {
+			t.Errorf("the vector's ownership signature does not verify over sha256(\"LNURLcash\"): %v", err)
+		}
 	}
-	if got := lnurlcash.EncodeCk1(signature); got != note.Ck1 {
+	if got := lnurlcash.EncodeCk1(payload); got != note.Ck1 {
 		t.Errorf("ck1 = %s, want %s", got, note.Ck1)
 	}
 
-	// the service's side: the ck1 it is handed recovers to the note it files
+	// the service's side: the ck1 it is handed verifies as the note it files
 	fromVector, err := lnurlcash.DecodeCk1(note.Ck1)
 	if err != nil {
 		t.Fatalf("ck1 does not decode: %v", err)
 	}
-	if note.OwnershipSignature != "" && fromVector != hex65(t, note.OwnershipSignature) {
-		t.Errorf("ck1 decodes to %x, want %s", fromVector, note.OwnershipSignature)
+	if fromVector.IsLegacy || fromVector.Current != payload {
+		t.Errorf("ck1 decodes to %x, want %x", fromVector.Bytes(), payload)
 	}
-	recovered, err := lnurlcash.RecoverNoteOwnershipPubkey(fromVector)
+	recovered, err := lnurlcash.RecoverNoteOwnershipPubkey(fromVector.Bytes())
 	if err != nil || hex.EncodeToString(recovered[:]) != note.NotePubkey {
-		t.Errorf("ck1 recovers to %x (%v), want %s", recovered, err, note.NotePubkey)
+		t.Errorf("ck1 verifies as %x (%v), want %s", recovered, err, note.NotePubkey)
 	}
 	for _, spelling := range []string{note.Ck1, strings.ToUpper(note.Ck1)} {
 		if id, err := lnurlcash.NoteIDOf(spelling); err != nil || id != note.NotePubkey {
@@ -1042,8 +1045,8 @@ func TestPart2Vectors(t *testing.T) {
 	// What this package implements. A vector describing anything else is a
 	// different scheme, and every value below would fail for that reason alone.
 	conventions := vectors.Conventions
-	if conventions.AddressBranch != "m/139'/1'/d1/d2/d3/d4" || conventions.HashingKey != "m/139'/1'/0" {
-		t.Fatalf("the vectors describe %s under %s, not the reference wallet's address path", conventions.AddressBranch, conventions.HashingKey)
+	if conventions.AddressBranch != "m/139'/d1/d2/d3/d4" || conventions.HashingKey != "m/139'/0" {
+		t.Fatalf("the vectors describe %s under %s, not LUD-25's literal address path", conventions.AddressBranch, conventions.HashingKey)
 	}
 	if conventions.OwnershipMessage != "LNURLcash" || conventions.CertificateMessage != "LNURLcash:<amount_msat>:<hex(pk)>" {
 		t.Fatalf("the vectors sign %q and certify %q", conventions.OwnershipMessage, conventions.CertificateMessage)
@@ -1051,13 +1054,11 @@ func TestPart2Vectors(t *testing.T) {
 	if conventions.AddressProofMessage != "LNURLcash:<register|unregister>:<username>" {
 		t.Fatalf("the vectors describe an unknown address proof message %q", conventions.AddressProofMessage)
 	}
-	inner := sha256.Sum256([]byte("Lightning Signed Message:" + conventions.OwnershipMessage))
-	ownershipDigest := sha256.Sum256(inner[:])
-	if got := hex.EncodeToString(ownershipDigest[:]); got != conventions.OwnershipDigest {
-		t.Errorf("ownership digest = %s, want %s", got, conventions.OwnershipDigest)
+	if got := string(lnurlcash.NoteOwnershipMessage()); got != conventions.OwnershipMessage {
+		t.Errorf("ownership message = %q, want %q", got, conventions.OwnershipMessage)
 	}
-	// The package signs under that digest if, and only if, it reproduces every
-	// ck1 below and recovers every one of them to its note.
+	// The package signs sha256 of that message if, and only if, it reproduces
+	// every ck1 below and verifies every one of them as its note.
 
 	mintPubkey := vectors.Mint.MintPubkey
 	if got := hex.EncodeToString(publicKeyOf(t, hex32(t, vectors.Mint.PrivateKey))); got != mintPubkey {
@@ -1085,12 +1086,8 @@ func TestPart2Vectors(t *testing.T) {
 				t.Errorf("cash root = %s, want %s", got, branch.CashRoot)
 			}
 
-			// d1..d4 hang off m/139'/1', keyed by m/139'/1'/0
-			addressRoot, err := lnurlcash.DeriveCashChild(root, 1+0x80000000)
-			if err != nil {
-				t.Fatal(err)
-			}
-			domain, err := lnurlcash.CashDomainIndices(addressRoot, branch.Host)
+			// the hashing key is m/139'/0, so the four levels hang off the root itself
+			domain, err := lnurlcash.CashDomainIndices(root, branch.Host)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1110,9 +1107,9 @@ func TestPart2Vectors(t *testing.T) {
 			if got := lnurlcash.CashNodeToHex(node); got != branch.AddressNode {
 				t.Fatalf("address node = %s, want %s", got, branch.AddressNode)
 			}
-			// the spec text's path is the Part 1 ladder's node; never this one
-			if part1, err := lnurlcash.DeriveCashDomainNode(root, branch.Host); err != nil || part1 == node {
-				t.Errorf("the address branch shares a node with the Part 1 ladder")
+			// the literal path: the address branch is the domain node itself
+			if domainNode, err := lnurlcash.DeriveCashDomainNode(root, branch.Host); err != nil || domainNode != node {
+				t.Errorf("the address branch is not the domain node (%v)", err)
 			}
 
 			cx, err := lnurlcash.CashNodeToCx1(node)
@@ -1232,7 +1229,10 @@ func TestPart2Vectors(t *testing.T) {
 	// The four decoders, and the checks, by the vectors' own type names.
 	decoders := map[string]func(string) (string, error){
 		"cp1": func(v string) (string, error) { b, err := lnurlcash.DecodeCp1(v); return hex.EncodeToString(b[:]), err },
-		"ck1": func(v string) (string, error) { b, err := lnurlcash.DecodeCk1(v); return hex.EncodeToString(b[:]), err },
+		"ck1": func(v string) (string, error) {
+			d, err := lnurlcash.DecodeCk1(v)
+			return hex.EncodeToString(d.Bytes()), err
+		},
 		"cs1": func(v string) (string, error) {
 			c, err := lnurlcash.DecodeCs1WithAmount(v)
 			return hex.EncodeToString(c.Signature[:]), err
@@ -1271,6 +1271,268 @@ func TestPart2Vectors(t *testing.T) {
 		if checks[invalid.Type](invalid.Value) {
 			t.Errorf("Is%s(%q) = true, but it is %s", invalid.Type, invalid.Value, invalid.Why)
 		}
+	}
+}
+
+// TestSpecVectors grades spec-vectors.json: LUD-25's own published "Test
+// Vectors" section, transcribed. Every value is what the spec document itself
+// publishes, checked against this package's real functions.
+func TestSpecVectors(t *testing.T) {
+	type specNote struct {
+		Index uint32 `json:"index"`
+		T     string `json:"t"`
+		Q     string `json:"Q"`
+		Pk    string `json:"pk"`
+		Sk    string `json:"sk"`
+		Cp1   string `json:"cp1"`
+	}
+	type specBranch struct {
+		SeedHex                string     `json:"seedHex"`
+		Domain                 string     `json:"domain"`
+		CashHashingKey         string     `json:"cashHashingKey"`
+		DomainIndices          []uint32   `json:"domainIndices"`
+		BranchPrivateKey       string     `json:"branchPrivateKey"`
+		BranchPubkeyCompressed string     `json:"branchPubkeyCompressed"`
+		BranchPubkeyXOnly      string     `json:"branchPubkeyXOnly"`
+		BranchParity           string     `json:"branchParity"`
+		ChainCode              string     `json:"chainCode"`
+		Cx1                    string     `json:"cx1"`
+		Notes                  []specNote `json:"notes"`
+		AddressProofs          []struct {
+			Action    string `json:"action"`
+			Username  string `json:"username"`
+			Message   string `json:"message"`
+			Digest    string `json:"digest"`
+			Signature string `json:"signature"`
+		} `json:"addressProofs"`
+	}
+	var vectors struct {
+		Version     int        `json:"version"`
+		Spec        string     `json:"spec"`
+		Description string     `json:"description"`
+		Vector1     specBranch `json:"vector1"`
+		Vector2     specBranch `json:"vector2"`
+		Vector3     struct {
+			SecretKey          string `json:"secretKey"`
+			PubkeyXOnly        string `json:"pubkeyXOnly"`
+			Digest             string `json:"digest"`
+			OwnershipSignature string `json:"ownershipSignature"`
+			Ck1                string `json:"ck1"`
+		} `json:"vector3"`
+		Vector4 struct {
+			MintSeedLabel   string `json:"mintSeedLabel"`
+			MintPrivateKey  string `json:"mintPrivateKey"`
+			MintPubkey      string `json:"mintPubkey"`
+			NotePubkey      string `json:"notePubkey"`
+			OtherNotePubkey string `json:"otherNotePubkey"`
+			Certificates    []struct {
+				AmountMsat int64  `json:"amountMsat"`
+				Message    string `json:"message"`
+				Digest     string `json:"digest"`
+				Signature  string `json:"signature"`
+				Cs1        string `json:"cs1"`
+			} `json:"certificates"`
+		} `json:"vector4"`
+	}
+	loadVectorsStrict(t, "spec-vectors.json", &vectors)
+	if vectors.Version != 1 {
+		t.Fatalf("spec-vectors.json is format version %d; these tests read version 1", vectors.Version)
+	}
+
+	branchOf := func(t *testing.T, v specBranch) lnurlcash.CashNode {
+		t.Helper()
+		root, err := lnurlcash.DeriveCashRoot(hexBytes(t, v.SeedHex, len(v.SeedHex)/2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashing, err := lnurlcash.DeriveCashChild(root, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hex.EncodeToString(hashing.PrivateKey[:]); got != v.CashHashingKey {
+			t.Errorf("cashHashingKey = %s, want %s", got, v.CashHashingKey)
+		}
+		indices, err := lnurlcash.CashDomainIndices(root, v.Domain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, want := range v.DomainIndices {
+			if indices[i] != want {
+				t.Errorf("d%d = %d, want %d", i+1, indices[i], want)
+			}
+		}
+		branch, err := lnurlcash.DeriveCashAddressNode(root, v.Domain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hex.EncodeToString(branch.PrivateKey[:]); got != v.BranchPrivateKey {
+			t.Errorf("branch private key = %s, want %s", got, v.BranchPrivateKey)
+		}
+		if got := hex.EncodeToString(branch.ChainCode[:]); got != v.ChainCode {
+			t.Errorf("chain code = %s, want %s", got, v.ChainCode)
+		}
+		compressed := publicKeyOf(t, branch.PrivateKey)
+		if got := hex.EncodeToString(compressed); got != v.BranchPubkeyCompressed {
+			t.Errorf("branch pubkey = %s, want %s", got, v.BranchPubkeyCompressed)
+		}
+		parity := map[byte]string{2: "even", 3: "odd"}[compressed[0]]
+		if parity != v.BranchParity {
+			t.Errorf("branch parity = %s, want %s", parity, v.BranchParity)
+		}
+		cx, err := lnurlcash.CashNodeToCx1(branch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hex.EncodeToString(cx.PubkeyXOnly[:]); got != v.BranchPubkeyXOnly {
+			t.Errorf("branch x-only key = %s, want %s", got, v.BranchPubkeyXOnly)
+		}
+		if got := lnurlcash.EncodeCx1(cx.PubkeyXOnly, cx.ChainCode); got != v.Cx1 {
+			t.Errorf("cx1 = %s, want %s", got, v.Cx1)
+		}
+		for _, note := range v.Notes {
+			pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, note.Index)
+			if err != nil {
+				t.Fatalf("#%d: %v", note.Index, err)
+			}
+			if got := hex.EncodeToString(pk[:]); got != note.Pk {
+				t.Errorf("#%d: pk = %s, want %s", note.Index, got, note.Pk)
+			}
+			if got := lnurlcash.EncodeCp1(pk); got != note.Cp1 {
+				t.Errorf("#%d: cp1 = %s, want %s", note.Index, got, note.Cp1)
+			}
+			sk, err := lnurlcash.DeriveNoteSecretKey(branch.PrivateKey, branch.ChainCode, note.Index)
+			if err != nil {
+				t.Fatalf("#%d: %v", note.Index, err)
+			}
+			if got := hex.EncodeToString(sk[:]); got != note.Sk {
+				t.Errorf("#%d: sk = %s, want %s", note.Index, got, note.Sk)
+			}
+			// x(sk_i . G) == pk_i, the round-trip 25.md calls out explicitly
+			if got := hex.EncodeToString(publicKeyOf(t, sk)[1:]); got != note.Pk {
+				t.Errorf("#%d: x(sk.G) = %s, want %s", note.Index, got, note.Pk)
+			}
+		}
+		return branch
+	}
+
+	t.Run("vector1", func(t *testing.T) { branchOf(t, vectors.Vector1) })
+	t.Run("vector2", func(t *testing.T) {
+		branch := branchOf(t, vectors.Vector2)
+		sk0, err := lnurlcash.DeriveNoteSecretKey(branch.PrivateKey, branch.ChainCode, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(vectors.Vector2.AddressProofs) == 0 {
+			t.Fatal("no address proofs")
+		}
+		for _, proof := range vectors.Vector2.AddressProofs {
+			if got, err := lnurlcash.AddressProofMessage(proof.Action, proof.Username); err != nil || got != proof.Message {
+				t.Errorf("%s: message = %q (%v), want %q", proof.Action, got, err, proof.Message)
+			}
+			if got, err := lnurlcash.AddressProofDigest(proof.Action, proof.Username); err != nil || hex.EncodeToString(got) != proof.Digest {
+				t.Errorf("%s: digest = %x (%v), want %s", proof.Action, got, err, proof.Digest)
+			}
+			signature, err := lnurlcash.SignAddressProof(sk0, proof.Action, proof.Username)
+			if err != nil || hex.EncodeToString(signature[:]) != proof.Signature {
+				t.Errorf("%s: signature = %x (%v), want %s", proof.Action, signature, err, proof.Signature)
+			}
+		}
+	})
+
+	t.Run("vector3", func(t *testing.T) {
+		v := vectors.Vector3
+		digest := sha256.Sum256(lnurlcash.NoteOwnershipMessage())
+		if got := hex.EncodeToString(digest[:]); got != v.Digest {
+			t.Errorf("ownership digest = %s, want %s", got, v.Digest)
+		}
+		payload, err := lnurlcash.SignNoteOwnership(hex32(t, v.SecretKey))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hex.EncodeToString(payload[:32]); got != v.PubkeyXOnly {
+			t.Errorf("pubkey = %s, want %s", got, v.PubkeyXOnly)
+		}
+		if got := hex.EncodeToString(payload[32:]); got != v.OwnershipSignature {
+			t.Errorf("ownership signature = %s, want %s", got, v.OwnershipSignature)
+		}
+		if got := lnurlcash.EncodeCk1(payload); got != v.Ck1 {
+			t.Errorf("ck1 = %s, want %s", got, v.Ck1)
+		}
+		if id, err := lnurlcash.NoteIDOf(v.Ck1); err != nil || id != v.PubkeyXOnly {
+			t.Errorf("ck1 is filed under %s (%v), want %s", id, err, v.PubkeyXOnly)
+		}
+	})
+
+	t.Run("vector4", func(t *testing.T) {
+		v := vectors.Vector4
+		if got := hex.EncodeToString(publicKeyOf(t, hex32(t, v.MintPrivateKey))); got != v.MintPubkey {
+			t.Fatalf("mint pubkey = %s, want %s", got, v.MintPubkey)
+		}
+		if len(v.Certificates) == 0 {
+			t.Fatal("no certificates")
+		}
+		for _, certificate := range v.Certificates {
+			if got := lnurlcash.NoteSignatureMessageForHash(v.NotePubkey, certificate.AmountMsat); got != certificate.Message {
+				t.Errorf("message = %q, want %q", got, certificate.Message)
+			}
+			digest := lnurlcash.NoteSignatureDigestForHash(v.NotePubkey, certificate.AmountMsat)
+			if got := hex.EncodeToString(digest); got != certificate.Digest {
+				t.Errorf("digest = %s, want %s", got, certificate.Digest)
+			}
+			var key secp256k1.ModNScalar
+			key.SetByteSlice(hexBytes(t, v.MintPrivateKey, 32))
+			compact := ecdsa.SignCompact(secp256k1.NewPrivateKey(&key), digest, true)
+			var signature [65]byte
+			copy(signature[:64], compact[1:])
+			signature[64] = compact[0] - 27 - 4
+			if got := hex.EncodeToString(signature[:]); got != certificate.Signature {
+				t.Errorf("signature = %s, want %s", got, certificate.Signature)
+			}
+			if got, err := lnurlcash.EncodeCs1WithAmount(certificate.AmountMsat, signature); err != nil || got != certificate.Cs1 {
+				t.Errorf("cs1 = %s (%v), want %s", got, err, certificate.Cs1)
+			}
+			if !lnurlcash.VerifyNoteSignatureHash(v.NotePubkey, certificate.AmountMsat, certificate.Signature, v.MintPubkey) {
+				t.Errorf("%d msat: the certificate does not verify", certificate.AmountMsat)
+			}
+			if lnurlcash.VerifyNoteSignatureHash(v.OtherNotePubkey, certificate.AmountMsat, certificate.Signature, v.MintPubkey) {
+				t.Errorf("%d msat: the certificate verifies for another note", certificate.AmountMsat)
+			}
+		}
+	})
+}
+
+// TestLnurlWalletCheckVector is an independent value from lnurl-wallet on the
+// literal path, from outside the conformance repo: a BIP39 mnemonic (no
+// passphrase) at mint.lnurlcash.com.
+func TestLnurlWalletCheckVector(t *testing.T) {
+	seed := bip39Seed(t, "dragon spell warfare girl patrol false erase surprise satisfy lucky curious ill")
+	if got := hex.EncodeToString(seed); got != "1c77403f77e0c9c558fa00cdea65ec5c5b7eb9bd10880219b9f5d8fa259aad14a81e9ad409641fd61ba3024de788cd88a1f0a27f0ff0a1a8ae140bd17bc3ee5c" {
+		t.Fatalf("seed = %s", got)
+	}
+	root, err := lnurlcash.DeriveCashRoot(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := lnurlcash.DeriveCashAddressNode(root, "mint.lnurlcash.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(branch.PrivateKey[:]); got != "ec94d2f4f89e8ea4f4335970e9a7781e30b4223eb405b070f9e3930afccbdc9b" {
+		t.Errorf("branch private key = %s", got)
+	}
+	if got := hex.EncodeToString(branch.ChainCode[:]); got != "62ba198d1cf6f086f85f867aff7f8d6845a65dd93152df219f1815d1f707bc99" {
+		t.Errorf("chain code = %s", got)
+	}
+	cx, err := lnurlcash.CashNodeToCx1(branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(pk[:]); got != "6fb7c0137fc17fccb337947b361580b7686219f2eeab9d47ed52a49191d5136c" {
+		t.Errorf("index-0 note pubkey = %s", got)
 	}
 }
 

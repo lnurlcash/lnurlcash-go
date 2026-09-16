@@ -3,19 +3,17 @@ package lnurlcash
 // LUD-25 Part 2: notes keyed by a public key.
 //
 // A Part 2 note is keyed by a public key rather than a hash. The holder keeps
-// sk, discloses pk as cp1<pk>, and spends the note with ck1, a recoverable
-// signature by sk over one fixed message: the service recovers pk from it and
-// looks the note up. The service certifies each note with cs1, the same
-// signature it has always made, over hex(pk) instead of a hash, so a recipient
-// can check issuance offline with nothing but the ck1 and the cs1.
+// sk, discloses pk as cp1<pk>, and spends the note with ck1: pk followed by a
+// BIP-340 signature by sk over one fixed digest. The service verifies the pair
+// and looks the note up by pk. The service certifies each note with cs1, the
+// same signature it has always made, over hex(pk) instead of a hash, so a
+// recipient can check issuance offline with nothing but the ck1 and the cs1.
 //
 // A watch-only cx1 - a branch's x-only key and its chain code - lets whoever
 // holds it derive every note key on the branch, which is how a service mints
 // straight to a holder's next key, but spend none of them.
 //
 // The names follow lnurlcash-kit's recoverable.ts, which follows lnurl-wallet.
-// Where the spec text and the reference wallet disagree, this follows the
-// wallet: see DeriveCashAddressNode.
 
 import (
 	"crypto/hmac"
@@ -27,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -98,23 +98,49 @@ func IsCp1(value string) bool {
 	return err == nil
 }
 
-// EncodeCk1 encodes a note's bearer secret: its 65-byte r || s || recovery id
-// ownership signature, from SignNoteOwnership.
-func EncodeCk1(signature [65]byte) string { return encodeFixed("ck", signature[:]) }
+// EncodeCk1 encodes a note's bearer secret: its 32-byte x-only public key
+// followed by its 64-byte BIP-340 signature, from SignNoteOwnership. Whoever
+// has it can spend the note.
+func EncodeCk1(payload [96]byte) string { return encodeFixed("ck", payload[:]) }
 
-// DecodeCk1 reads a ck1 back to its signature.
-func DecodeCk1(value string) ([65]byte, error) {
-	var out [65]byte
-	payload, err := decodeFixed("ck", value, len(out))
-	if err != nil {
-		return out, err
+// DecodedCk1 is what a ck1 carries. A current ck1 fills Current. A legacy one,
+// the pre-Schnorr 65-byte recoverable-ECDSA bearer, fills Legacy and sets
+// IsLegacy instead: it is still read only so existing notes stay spendable
+// long enough to rotate into the current format.
+type DecodedCk1 struct {
+	Current  [96]byte
+	Legacy   [65]byte
+	IsLegacy bool
+}
+
+// Bytes returns whichever payload the ck1 carried.
+func (d DecodedCk1) Bytes() []byte {
+	if d.IsLegacy {
+		return d.Legacy[:]
 	}
-	copy(out[:], payload)
+	return d.Current[:]
+}
+
+// DecodeCk1 reads a ck1 back to its payload, the current 96-byte form or the
+// legacy 65-byte one.
+func DecodeCk1(value string) (DecodedCk1, error) {
+	var out DecodedCk1
+	payload, err := decodeFixed("ck", value, len(out.Current))
+	if err == nil {
+		copy(out.Current[:], payload)
+		return out, nil
+	}
+	legacy, legacyErr := decodeFixed("ck", value, len(out.Legacy))
+	if legacyErr != nil {
+		return DecodedCk1{}, err
+	}
+	copy(out.Legacy[:], legacy)
+	out.IsLegacy = true
 	return out, nil
 }
 
-// IsCk1 reports whether value is a well-formed ck1. Well-formed only: whether
-// it recovers to a key is NoteIDOf's question.
+// IsCk1 reports whether value is a well-formed ck1, either form. Well-formed
+// only: whether its proof verifies is NoteIDOf's question.
 func IsCk1(value string) bool {
 	_, err := DecodeCk1(value)
 	return err == nil
@@ -405,20 +431,32 @@ func DeriveNoteSecretKey(branchPrivateKey, chainCode [32]byte, index uint32) ([3
 
 // ---- ownership proofs ----
 //
-//	message = "LNURLcash"
-//	digest  = sha256(sha256("Lightning Signed Message:" || message))
+//	sig = BIP340.Sign(sk, sha256("LNURLcash"))
+//	ck1 = bech32m("ck", pk || sig)
 //
-// One fixed message for every note, and RFC6979 nonces, so re-deriving a key
-// reproduces the same ck1 byte for byte: the value submitted to spend a note
-// is the value shown to prove it. Another signer can still produce a
-// different valid ck1 for the same key - any nonce makes a signature the
-// service recovers the same pk from - so a note is identified by NoteIDOf,
-// never by comparing ck1 strings.
+// One fixed digest and fixed all-zero BIP-340 auxiliary input make the bearer
+// value deterministic: re-deriving a key reproduces its one ck1 byte for byte.
+// The message is hashed to 32 bytes before signing, rather than signed as the
+// raw 9-byte string, because BIP-340's own reference implementation and most
+// conforming Schnorr signers (libsecp256k1's schnorrsig module and btcec's
+// included) only accept a 32-byte message (2026-09-16, luds#6de59b2).
 
-var noteOwnershipDigest = func() [32]byte {
+var noteOwnershipMessage = []byte("LNURLcash")
+
+var noteOwnershipDigest = sha256.Sum256(noteOwnershipMessage)
+
+// legacyNoteOwnershipDigest is what a pre-Schnorr 65-byte ck1 was signed over.
+var legacyNoteOwnershipDigest = func() [32]byte {
 	inner := sha256.Sum256([]byte(lightningSignedMessagePrefix + "LNURLcash"))
 	return sha256.Sum256(inner[:])
 }()
+
+// NoteOwnershipMessage returns the message every ownership signature is made
+// over. Since 2026-09-16 it is signed as its sha256 digest; before that, as
+// the raw bytes, which RecoverNoteOwnershipPubkey still reads back.
+func NoteOwnershipMessage() []byte {
+	return append([]byte(nil), noteOwnershipMessage...)
+}
 
 // decred lays a compact signature out as header || r || s, the header being 27,
 // plus 4 for a compressed key, plus the recovery id. The wire puts the bare
@@ -426,49 +464,114 @@ var noteOwnershipDigest = func() [32]byte {
 // rebuilt.
 const compactHeaderCompressed = 27 + 4
 
-// SignNoteOwnership signs the ownership message with a note's secret key:
-// RFC6979, low-S, laid out r || s || recovery id as the wire wants it. Encode
-// it with EncodeCk1 to spend the note - which makes the result bearer
-// material, exactly as the secret key is.
-func SignNoteOwnership(secretKey [32]byte) ([65]byte, error) {
-	var out [65]byte
-	var key secp256k1.ModNScalar
+// SignNoteOwnership signs the ownership digest with a note's secret key and
+// returns the 96-byte pk || sig payload. Encode it with EncodeCk1 to spend the
+// note - which makes the result bearer material, exactly as the secret key is.
+func SignNoteOwnership(secretKey [32]byte) ([96]byte, error) {
+	var out [96]byte
+	var key btcec.ModNScalar
 	if key.SetBytes(&secretKey) != 0 || key.IsZero() {
 		return out, &ProtocolError{Detail: "a note secret key is a 32-byte scalar in [1, n)"}
 	}
-	compact := ecdsa.SignCompact(secp256k1.NewPrivateKey(&key), noteOwnershipDigest[:], true)
-	copy(out[:64], compact[1:])
-	out[64] = compact[0] - compactHeaderCompressed
+	private := btcec.PrivKeyFromScalar(&key)
+	signature, err := schnorr.Sign(private, noteOwnershipDigest[:], schnorr.CustomNonce([32]byte{}))
+	if err != nil {
+		return out, &ProtocolError{Detail: "could not sign the note ownership message"}
+	}
+	copy(out[:32], schnorr.SerializePubKey(private.PubKey()))
+	copy(out[32:], signature.Serialize())
 	return out, nil
 }
 
-// RecoverNoteOwnershipPubkey recovers a note's x-only public key, offline,
-// from its ownership signature. An error for one that does not recover,
-// including a recovery id outside 0 to 3.
-func RecoverNoteOwnershipPubkey(signature [65]byte) ([32]byte, error) {
+// RecoverNoteOwnershipPubkey validates an ownership payload and returns the
+// note's x-only public key. A 96-byte pk || sig is verified against the current
+// sha256 digest first, then against the pre-2026-09-16 raw message, so a note
+// minted under that scheme stays redeemable until it is rotated;
+// SignNoteOwnership never produces that shape anymore. A legacy 65-byte
+// r || s || recovery id signature is recovered as before. An error for an
+// invalid proof or any other length.
+func RecoverNoteOwnershipPubkey(payload []byte) ([32]byte, error) {
 	var out [32]byte
-	if signature[64] > 3 {
-		return out, &ProtocolError{Detail: "a recoverable signature ends in a recovery id of 0 to 3"}
+	switch len(payload) {
+	case 96:
+		pubkey, err := schnorr.ParsePubKey(payload[:32])
+		if err != nil {
+			return out, &ProtocolError{Detail: "that ownership proof does not verify"}
+		}
+		signature, err := schnorr.ParseSignature(payload[32:])
+		if err != nil {
+			return out, &ProtocolError{Detail: "that ownership proof does not verify"}
+		}
+		if !signature.Verify(noteOwnershipDigest[:], pubkey) && !verifyBIP340(payload[:32], payload[32:], noteOwnershipMessage) {
+			return out, &ProtocolError{Detail: "that ownership proof does not verify"}
+		}
+		copy(out[:], payload[:32])
+		return out, nil
+	case 65:
+		if payload[64] > 3 {
+			return out, &ProtocolError{Detail: "a recoverable signature ends in a recovery id of 0 to 3"}
+		}
+		var compact [65]byte
+		compact[0] = compactHeaderCompressed + payload[64]
+		copy(compact[1:], payload[:64])
+		pubkey, _, err := ecdsa.RecoverCompact(compact[:], legacyNoteOwnershipDigest[:])
+		if err != nil {
+			return out, &ProtocolError{Detail: "that ownership signature does not recover to a key"}
+		}
+		copy(out[:], pubkey.SerializeCompressed()[1:])
+		return out, nil
+	default:
+		return out, &ProtocolError{Detail: "an ownership proof is 96 bytes, or a legacy 65"}
 	}
-	var compact [65]byte
-	compact[0] = compactHeaderCompressed + signature[64]
-	copy(compact[1:], signature[:64])
-	pubkey, _, err := ecdsa.RecoverCompact(compact[:], noteOwnershipDigest[:])
+}
+
+var bip340ChallengeTag = sha256.Sum256([]byte("BIP0340/challenge"))
+
+// verifyBIP340 is BIP-340 verification for a message of any length, which the
+// spec allows and btcec's Verify does not. It exists only to read back a ck1
+// signed over the raw 9-byte message before 2026-09-16.
+func verifyBIP340(pubkeyXOnly, signature, message []byte) bool {
+	if len(pubkeyXOnly) != 32 || len(signature) != 64 {
+		return false
+	}
+	pubkey, err := schnorr.ParsePubKey(pubkeyXOnly)
 	if err != nil {
-		return out, &ProtocolError{Detail: "that ownership signature does not recover to a key"}
+		return false
 	}
-	copy(out[:], pubkey.SerializeCompressed()[1:])
-	return out, nil
+	var r secp256k1.FieldVal
+	if r.SetByteSlice(signature[:32]) {
+		return false
+	}
+	var s secp256k1.ModNScalar
+	if s.SetByteSlice(signature[32:]) {
+		return false
+	}
+	h := sha256.New()
+	for _, part := range [][]byte{bip340ChallengeTag[:], bip340ChallengeTag[:], signature[:32], pubkeyXOnly, message} {
+		h.Write(part)
+	}
+	var e secp256k1.ModNScalar
+	e.SetByteSlice(h.Sum(nil))
+	e.Negate()
+	var point, sG, eP, R secp256k1.JacobianPoint
+	pubkey.AsJacobian(&point)
+	secp256k1.ScalarBaseMultNonConst(&s, &sG)
+	secp256k1.ScalarMultNonConst(&e, &point, &eP)
+	secp256k1.AddNonConst(&sG, &eP, &R)
+	if (R.X.IsZero() && R.Y.IsZero()) || R.Z.IsZero() {
+		return false
+	}
+	R.ToAffine()
+	return !R.Y.IsOdd() && r.Equals(&R.X)
 }
 
 // ---- a note's k1, either kind ----
 
 // NoteIDOf returns the id a service files a note under: hex sha256(k1) for a
-// Part 1 secret, and for a Part 2 ck1 the hex x-only key it recovers to. An
-// error for anything else, including a ck1 that does not recover.
+// Part 1 secret, and for a Part 2 ck1 the verified hex x-only key it embeds.
+// An error for anything else, including a ck1 whose proof does not verify.
 //
-// Two different ck1 strings can share an id, so compare notes by this, never
-// by their k1.
+// Compare notes by this, never by an unverified payload.
 func NoteIDOf(k1 string) (string, error) {
 	value := strings.ToLower(strings.TrimSpace(k1))
 	if IsPreimage(value) {
@@ -498,36 +601,27 @@ func NoteLookupOf(k1 string) (string, error) {
 }
 
 func ck1Pubkey(value string) ([32]byte, error) {
-	signature, err := DecodeCk1(value)
+	decoded, err := DecodeCk1(value)
 	if err != nil {
 		return [32]byte{}, &ProtocolError{Detail: "a k1 is 32 bytes of hex or a ck1"}
 	}
-	return RecoverNoteOwnershipPubkey(signature)
+	return RecoverNoteOwnershipPubkey(decoded.Bytes())
 }
 
 // ---- the address branch ----
 
-const cashAddressBranch = uint32(1)
-
-// DeriveCashAddressNode returns m/139'/1'/d1/d2/d3/d4 for one mint: the branch
-// Part 2 note keys are tweaked from. d1..d4 are drawn exactly as the Part 1
-// ladder draws them, from HMAC-SHA256(the private key at m/139'/1'/0, host),
-// raw and hardened only by magnitude.
-//
-// This is lnurl-wallet's path (cashSecrets.ts), and it is the one to use. The
-// spec text roots the branch at m/139'/d1/d2/d3/d4 - the very node
-// DeriveCashDomainNode already returns for Part 1 - so a wallet following the
-// text would find none of the reference wallet's notes, and share a node
-// between two schemes besides.
+// DeriveCashAddressNode returns m/139'/d1/d2/d3/d4 for one mint - the literal
+// path LUD-25's text specifies, and the exact node DeriveCashDomainNode already
+// derives for any service. There is no separate purpose for Part 2: an earlier
+// reference-wallet extension deterministically derived Part 1 secrets off this
+// same root too, under a 1' sub-purpose kept just for this branch to avoid
+// colliding with it; that extension is gone (see cash.go), so there is nothing
+// left to collide with.
 //
 // Bearer material for every note on the branch. Hand out CashNodeToCx1 of it,
 // never the node.
 func DeriveCashAddressNode(root CashNode, host string) (CashNode, error) {
-	branch, err := DeriveCashChild(root, cashAddressBranch+hardened)
-	if err != nil {
-		return CashNode{}, err
-	}
-	return DeriveCashDomainNode(branch, host)
+	return DeriveCashDomainNode(root, host)
 }
 
 // CashNodeToCx1 is the watch-only half of an address node: what a holder
