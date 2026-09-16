@@ -6,6 +6,7 @@ package lnurlcash_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	lnurlcash "github.com/lnurlcash/lnurlcash-go"
 )
 
@@ -200,34 +202,92 @@ func TestMintsToAKeyWithTheCommentAlone(t *testing.T) {
 	}
 }
 
-// highSTwin is a ck1's other valid spelling: (r, n - s) with the recovery id's
-// parity flipped. Anyone can make it from the ck1 alone, and it recovers to the
-// same key - which is why a note is compared by id, never by its ck1.
-func highSTwin(t *testing.T, ck1 string) string {
+// legacyCk1 is the pre-Schnorr spelling of a note's ck1: a 65-byte
+// r || s || recovery id ECDSA signature over the Lightning-signed "LNURLcash".
+// Nothing produces one anymore, but notes minted under it must stay readable
+// until they are rotated.
+func legacyCk1(t *testing.T, secretKeyHex string) string {
 	t.Helper()
-	signature, err := lnurlcash.DecodeCk1(ck1)
+	var key secp256k1.ModNScalar
+	key.SetByteSlice(hexBytes(t, secretKeyHex, 32))
+	inner := sha256.Sum256([]byte("Lightning Signed Message:LNURLcash"))
+	digest := sha256.Sum256(inner[:])
+	compact := ecdsa.SignCompact(secp256k1.NewPrivateKey(&key), digest[:], true)
+	payload := append(append([]byte(nil), compact[1:]...), compact[0]-27-4)
+	words, err := bech32.ConvertBits(payload, 8, 5, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var s secp256k1.ModNScalar
-	s.SetByteSlice(signature[32:64])
-	s.Negate()
-	flipped := s.Bytes()
-	copy(signature[32:64], flipped[:])
-	signature[64] ^= 1
-	return lnurlcash.EncodeCk1(signature)
+	encoded, err := bech32.EncodeM("ck", words)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+// rawMessageCk1 is part2.json's first note (index 0 of mint.example) as
+// lnurlcash-conformance 0.12.0 spelled it: the same key, but a BIP-340
+// signature over the raw 9-byte "LNURLcash" rather than its sha256 digest.
+const rawMessageCk1 = "ck12e7xv2ca3njkjwuun6zm4u4v3ven69hfc33nmaxcemns7g9y7qeklrf8ych23gfjn0zt4k5g6ghfehepjte5ws7gcxqthg8965zfwazua5564jxx4fjwn3a78j2t55y24l03s7ldw2kmn672wrg5xq790yz4088e"
+
+func TestOneKeyReproducesOneCk1(t *testing.T) {
+	part2 := loadPart2(t)
+	key := hex32(t, part2.a.NoteSecretKey)
+	a, err := lnurlcash.SignNoteOwnership(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := lnurlcash.SignNoteOwnership(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b || lnurlcash.EncodeCk1(a) != part2.a.Ck1 {
+		t.Errorf("signing twice gave %s and %s, want %s both times", lnurlcash.EncodeCk1(a), lnurlcash.EncodeCk1(b), part2.a.Ck1)
+	}
+}
+
+func TestALegacyCk1StaysReadableForRotation(t *testing.T) {
+	part2 := loadPart2(t)
+	legacy := legacyCk1(t, part2.a.NoteSecretKey)
+	decoded, err := lnurlcash.DecodeCk1(legacy)
+	if err != nil || !decoded.IsLegacy || len(decoded.Bytes()) != 65 {
+		t.Fatalf("a legacy ck1 decodes to %+v (%v)", decoded, err)
+	}
+	if !lnurlcash.IsCk1(legacy) {
+		t.Error("IsCk1 refused a legacy ck1")
+	}
+	if id, err := lnurlcash.NoteIDOf(legacy); err != nil || id != part2.a.NotePubkey {
+		t.Errorf("a legacy ck1 is filed under %s (%v), want %s", id, err, part2.a.NotePubkey)
+	}
+	if lookup, err := lnurlcash.NoteLookupOf(legacy); err != nil || lookup != part2.a.Cp1 {
+		t.Errorf("a legacy ck1 is looked up by %s (%v), want its cp1", lookup, err)
+	}
+}
+
+func TestARawMessageCk1StaysReadableForRotation(t *testing.T) {
+	part2 := loadPart2(t)
+	if rawMessageCk1 == part2.a.Ck1 {
+		t.Fatal("the raw-message spelling is the current one")
+	}
+	decoded, err := lnurlcash.DecodeCk1(rawMessageCk1)
+	if err != nil || decoded.IsLegacy {
+		t.Fatalf("a raw-message ck1 decodes to %+v (%v)", decoded, err)
+	}
+	if id, err := lnurlcash.NoteIDOf(rawMessageCk1); err != nil || id != part2.a.NotePubkey {
+		t.Errorf("a raw-message ck1 is filed under %s (%v), want %s", id, err, part2.a.NotePubkey)
+	}
+	// and its signature is not simply accepted for any message: moved onto
+	// another key, it verifies under neither scheme
+	other, _ := lnurlcash.DecodeCk1(part2.b.Ck1)
+	moved := decoded.Current
+	copy(moved[:32], other.Current[:32])
+	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(moved[:]); err == nil {
+		t.Error("a raw-message signature verified under another key")
+	}
 }
 
 func TestAnEchoedCk1IsComparedByTheNoteItNames(t *testing.T) {
 	part2 := loadPart2(t)
-	twin := highSTwin(t, part2.a.Ck1)
-	if twin == part2.a.Ck1 {
-		t.Fatal("the twin is the same string")
-	}
-	if id, err := lnurlcash.NoteIDOf(twin); err != nil || id != part2.a.NotePubkey {
-		t.Fatalf("the twin recovers to %s (%v), not the note", id, err)
-	}
-
 	queried := "https://mint.example/w?k1=" + part2.a.Ck1
 	answer := func(k1 string) []byte {
 		body, _ := json.Marshal(map[string]any{
@@ -236,8 +296,10 @@ func TestAnEchoedCk1IsComparedByTheNoteItNames(t *testing.T) {
 		})
 		return body
 	}
-	if _, err := lnurlcash.ParseNoteInfo(answer(twin), queried, lnurlcash.Policy{}); err != nil {
-		t.Errorf("another spelling of the same note was refused: %v", err)
+	for _, spelling := range []string{legacyCk1(t, part2.a.NoteSecretKey), rawMessageCk1} {
+		if _, err := lnurlcash.ParseNoteInfo(answer(spelling), queried, lnurlcash.Policy{}); err != nil {
+			t.Errorf("another spelling of the same note was refused: %v", err)
+		}
 	}
 	var protocol *lnurlcash.ProtocolError
 	if _, err := lnurlcash.ParseNoteInfo(answer(part2.b.Ck1), queried, lnurlcash.Policy{}); !errors.As(err, &protocol) {
@@ -271,16 +333,22 @@ func TestPart2RefusesWhatIsNotAKey(t *testing.T) {
 		}
 	}
 
-	signature, _ := lnurlcash.DecodeCk1(part2.a.Ck1)
-	badRecovery := signature
-	badRecovery[64] = 4
-	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(badRecovery); err == nil {
-		t.Error("recovered with a recovery id of 4")
+	current, _ := lnurlcash.DecodeCk1(part2.a.Ck1)
+	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(current.Current[:95]); err == nil {
+		t.Error("verified a truncated ownership proof")
 	}
-	corrupted := signature
-	corrupted[10] ^= 0xff
-	if recovered, err := lnurlcash.RecoverNoteOwnershipPubkey(corrupted); err == nil && hex.EncodeToString(recovered[:]) == part2.a.NotePubkey {
-		t.Error("a corrupted signature still recovers to the note")
+	for _, at := range []int{10, 40, 90} {
+		corrupted := current.Current
+		corrupted[at] ^= 0xff
+		if recovered, err := lnurlcash.RecoverNoteOwnershipPubkey(corrupted[:]); err == nil && hex.EncodeToString(recovered[:]) == part2.a.NotePubkey {
+			t.Errorf("a proof corrupted at byte %d still verifies as the note", at)
+		}
+	}
+	legacy, _ := lnurlcash.DecodeCk1(legacyCk1(t, part2.a.NoteSecretKey))
+	badRecovery := legacy.Legacy
+	badRecovery[64] = 4
+	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(badRecovery[:]); err == nil {
+		t.Error("recovered with a recovery id of 4")
 	}
 }
 
@@ -332,6 +400,7 @@ func TestRefusesNonZeroPadding(t *testing.T) {
 		decode func(string) error
 	}{
 		{"cp", part2.a.Cp1, func(v string) error { _, err := lnurlcash.DecodeCp1(v); return err }},
+		{"ck", part2.a.Ck1, func(v string) error { _, err := lnurlcash.DecodeCk1(v); return err }},
 		{"cx", part2.cx1, func(v string) error { _, err := lnurlcash.DecodeCx1(v); return err }},
 	} {
 		_, words, err := bech32.DecodeNoLimit(c.value)
@@ -596,8 +665,8 @@ func FuzzPart2Decoders(f *testing.F) {
 		if key, err := lnurlcash.DecodeCp1(value); err == nil && lnurlcash.EncodeCp1(key) != canonical {
 			t.Errorf("cp1 %q decodes to %x, which encodes differently", value, key)
 		}
-		if signature, err := lnurlcash.DecodeCk1(value); err == nil && lnurlcash.EncodeCk1(signature) != canonical {
-			t.Errorf("ck1 %q decodes to %x, which encodes differently", value, signature)
+		if decoded, err := lnurlcash.DecodeCk1(value); err == nil && !decoded.IsLegacy && lnurlcash.EncodeCk1(decoded.Current) != canonical {
+			t.Errorf("ck1 %q decodes to %x, which encodes differently", value, decoded.Current)
 		}
 		if signature, err := lnurlcash.DecodeCs1(value); err == nil && lnurlcash.EncodeCs1(signature) != canonical {
 			t.Errorf("cs1 %q decodes to %x, which encodes differently", value, signature)

@@ -401,11 +401,9 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 	}, nil
 }
 
-// sameNote reports whether two k1s name one note. A Part 1 secret has one
-// spelling, but a Part 2 note has as many valid ck1s as a signer has nonces -
-// and anyone can flip a signature to its high-S twin - so a service echoing a
-// different ck1 that recovers to the same key has named the same note, not a
-// different one.
+// sameNote reports whether two k1s name one note. Exact spelling is preferred;
+// valid ck1 values may also be compared by their verified embedded note key.
+// A k1 with no note id at all still has to come back as the same string.
 func sameNote(a, b string) bool {
 	if strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b)) {
 		return true
@@ -920,9 +918,7 @@ func MintInvoiceRequestWithHash(payCallback string, amountMsat int64, h string) 
 // The secret comes back on Request.NewSecrets. Persist it BEFORE paying the
 // invoice this returns. Paying for a note and then losing its secret is the one
 // way the comment-bound scheme is worse than the preimage one it replaced, and
-// persisting first removes it entirely. Drawing the secret from the seed
-// derivation rather than the CSPRNG makes the note recoverable from birth,
-// without any rotate at all.
+// persisting first removes it entirely.
 func MintInvoiceRequest(payCallback string, amountMsat int64, mintSecret string) (Request, error) {
 	// Checked before hashing, so a malformed secret is ErrRequestRefused - the
 	// caller's own input, nothing sent - rather than the ProtocolError HashK1

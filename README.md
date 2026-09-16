@@ -174,53 +174,46 @@ about 2.1e21. It is computed split.
 99.9999% fee, so any guard on it returns a non-minimal answer — and the
 *service* picks the fee.
 
-## Seed-recoverable note secrets
+## Seed derivation
 
-LUD-25 specifies them, and this package implements the specified scheme:
+LUD-25 derives a wallet's per-mint branch from its seed, and this package
+implements the specified path:
 
 ```
 cashHashingKey   = m/139'/0
 (d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, host)[0..16] as 4 uint32
-k1_i             = m/139'/d1/d2/d3/d4/i'
+domainNode       = m/139'/d1/d2/d3/d4
 ```
 
 `d1..d4` are used **exactly as they fall**. BIP-32 reads any index `>= 2^31`
 as hardened, so which of the four levels are hardened is decided by the mint's
 own host name. Masking the top bit, or hardening all four, derives a different
-tree and restores nothing, silently. Only `i` is always hardened.
+tree and restores nothing, silently.
 
 ```go
-root, err := lnurlcash.DeriveCashRoot(seed)          // m/139'
-source, err := lnurlcash.NewCashSecretSource(root, host, counter)
-k1, err := source.Next()                             // hand to a mutation
-save(host, source.NextIndex())                       // BEFORE the hash goes out
+root, err := lnurlcash.DeriveCashRoot(seed)               // m/139'
+node, err := lnurlcash.DeriveCashDomainNode(root, host)   // m/139'/d1/d2/d3/d4
 ```
 
-`DeriveCashDomainNode` is its own step for a reason: every unhardened level
-sits at or above it, so a hardware signer provisioned with that node rather
-than the seed needs **no elliptic curve at all**. The cost is that whoever
-derives it can derive every note secret held at that mint - provisioning
-material, one mint's subtree, not the wallet.
+That domain node is Part 2's address branch, below. Part 1 secrets are not
+derived from the seed at all: LUD-25 has the wallet draw them as plain
+randomness, which is what `GenerateNoteSecret` does. An earlier deterministic
+Part 1 ladder beneath this node (`DeriveCashSecret`, `CashSecretAt`,
+`CashSecretSource`) was never part of the spec and is gone.
 
 `DeriveNoteRoot` / `DeriveNoteSecret` are the pre-spec HMAC scheme this
 project shipped before the draft had one. Not deprecated, because notes minted
-under it are still money; just not what to mint under.
-
-**The counter is half the backup.** A service must answer a hash lookup for a
-burned note exactly as it answers one for a note it never issued, and a rotate
-burns the index below, so a wallet that has rotated more than its gap limit
-cannot find its own position by scanning. The per-host counter is not secret -
-an index reveals nothing without the root - so back it up, and merge it
-upwards only. `BuildNoteInfoURLByHash` is the private lookup a walk should
-use; asking by secret publishes the very indices the wallet is about to mint
-under.
+under it are still money; just not what to mint under. `BuildNoteInfoURLByHash`
+is the private lookup a restore walk over them should use; asking by secret
+publishes the very secrets it is looking for.
 
 ## Notes keyed by a public key (LUD-25 Part 2)
 
 A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`; the mint
-only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, a
-recoverable signature by `sk` over the fixed message `LNURLcash`, and the mint
-recovers `pk` from it. The mint's certificate, `cs1…`, carries the note amount
+only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`:
+the 32-byte `pk` followed by a BIP-340 Schnorr signature by `sk` over
+`sha256("LNURLcash")`. The mint verifies the pair and uses `pk` to find the
+note. The mint's certificate, `cs1…`, carries the note amount
 in its prefix using BOLT 11 amount rules and contains the signature over
 `LNURLcash:<amount_msat>:<hex(pk)>`, so a recipient can recover the claimed
 amount and check the note offline. A `cp1` note is the only kind the spec
@@ -228,14 +221,14 @@ certifies.
 
 ```go
 root, _ := lnurlcash.DeriveCashRoot(seed)
-node, _ := lnurlcash.DeriveCashAddressNode(root, "mint.example") // m/139'/1'/d1..d4
+node, _ := lnurlcash.DeriveCashAddressNode(root, "mint.example") // m/139'/d1/d2/d3/d4
 cx, _ := lnurlcash.CashNodeToCx1(node)
 cx1 := lnurlcash.EncodeCx1(cx.PubkeyXOnly, cx.ChainCode)          // watch-only
 
 pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, i) // what a watcher derives
 sk, _ := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, i)
-sig, _ := lnurlcash.SignNoteOwnership(sk)
-ck1 := lnurlcash.EncodeCk1(sig)                                     // the bearer secret
+proof, _ := lnurlcash.SignNoteOwnership(sk)                         // pk || sig, 96 bytes
+ck1 := lnurlcash.EncodeCk1(proof)                                   // the bearer secret
 
 lnurlcash.VerifyNoteSignature(ck1, amountMsat, cs1, mintPubkey)     // offline
 certificate, _ := lnurlcash.DecodeCs1WithAmount(cs1)                // amount + signature
@@ -250,7 +243,7 @@ carried amount with another value.
 
 Reference-mint address management proves control with the address branch's
 index-0 private key. `SignAddressProof(sk0, action, username)` returns the raw
-`r || s || recovery-id` proof over `LNURLcash:<action>:<username>`; action is
+64-byte BIP-340 proof over `sha256("LNURLcash:<action>:<username>")`; action is
 `register` or `unregister`, and the username must be normalised exactly as it
 is sent to the service.
 
@@ -258,12 +251,17 @@ A `ck1` goes anywhere a `k1` does: a note URL, `FetchNoteInfo`, rotate, split,
 merge and melt. A `cp1` goes anywhere an output does: `RequestMintInvoiceWithHash`
 sends it as the comment alone, and the `*WithHash` calls send it as `p1`/`p2`
 while a hash keeps `h`/`h2`. `NoteIDOf(k1)` is the id a mint files either kind
-under - compare notes by it, because one note has many valid `ck1` strings -
-and `NoteLookupOf(k1)` is what to pass `FetchNoteInfoByHash`.
+under - compare notes by it, never by `k1` - and `NoteLookupOf(k1)` is what
+to pass `FetchNoteInfoByHash`. A `ck1` is deterministic from its note key, so
+seed recovery reproduces it byte for byte. `DecodeCk1` and the lookup helpers
+also accept the old 65-byte recoverable-ECDSA shape, and a 96-byte proof
+signed over the raw message rather than its digest, so existing notes remain
+spendable; rotate those into a current `ck1` rather than issuing new legacy
+values.
 
-- **The branch follows the reference wallet, not the spec text.** The text
-  says `m/139'/d1..d4`, which is the Part 1 ladder's own node; lnurl-wallet
-  uses `m/139'/1'/d1..d4`, hashing key at `m/139'/1'/0`, and so does this.
+- **The branch is the spec's literal path.** `m/139'/d1/d2/d3/d4`, hashing
+  key at `m/139'/0`: the same node `DeriveCashDomainNode` returns. Notes
+  received under the earlier `m/139'/1'` hop are not on it.
 - **A `cx1` links every note on its branch.** It spends nothing, but whoever
   holds it can list every key on the branch. Receive on it, then rotate off.
 - **`i` is any uint32**, four bytes big-endian, never hardened.

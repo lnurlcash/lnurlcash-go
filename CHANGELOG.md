@@ -3,6 +3,65 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
+## Unreleased
+
+**Breaking.** All three changes below alter public signatures or derived
+values, and a `ck1`/`cx1` produced by 0.1.0 is not what this version produces.
+
+### Ownership and address proofs sign a sha256 digest, not the raw message
+
+BIP-340's own reference implementation, and most conforming Schnorr signers
+(`libsecp256k1`'s `schnorrsig` module and btcec's `schnorr.Sign` included),
+only accept a 32-byte message. Matches `lnurl-wallet#167`/`#168` and
+`luds#6de59b2`.
+
+- `SignNoteOwnership` signs `sha256("LNURLcash")` instead of the raw string.
+  `RecoverNoteOwnershipPubkey` verifies against that digest first, then falls
+  back to the pre-2026-09-16 raw-message scheme so a note minted under it
+  stays redeemable until it is rotated - `SignNoteOwnership` never produces
+  that shape, only `RecoverNoteOwnershipPubkey` reads it back.
+- `SignAddressProof` signs `AddressProofDigest`, now `sha256` of the new
+  `AddressProofMessage`, for the same reason: `username` is variable-length,
+  so the raw message would otherwise only rarely land on 32 bytes. No
+  fallback here - a register/unregister proof is a fresh action a wallet
+  initiates itself, never a stored bearer secret read back later.
+- Grade against `lnurlcash-conformance` 0.13.0's regenerated Part 2, Nostr-
+  seed and spec vectors, including LUD-25's own published Test Vectors
+  (`spec-vectors.json`).
+
+### BIP-340 wallet ownership proofs
+
+- Follow the revised LUD-25 `ck1` format: a 96-byte payload containing the
+  32-byte x-only note key and a 64-byte BIP-340 signature, with all-zero
+  auxiliary input so seed recovery reproduces it byte for byte. `cs1` remains
+  recoverable ECDSA and is unchanged.
+- `SignNoteOwnership` now returns that complete `[96]byte` payload and
+  `EncodeCk1` takes it; `RecoverNoteOwnershipPubkey` takes a `[]byte` and
+  verifies the embedded signature before returning its key.
+- `DecodeCk1` returns `DecodedCk1`, and it, `IsCk1`, `NoteIDOf`,
+  `NoteLookupOf` and verification continue accepting the old 65-byte
+  recoverable-ECDSA form so existing bearer notes can be rotated;
+  `DecodedCk1.IsLegacy` marks which shape was read. New signing and encoding
+  only emit the Schnorr form.
+- Add `NoteOwnershipMessage`. `SignAddressProof` now returns a raw
+  `[64]byte` BIP-340 signature.
+- A mint echoing a different `ck1` for the same verified note key is still the
+  same note; one naming another key is still refused.
+
+### The address branch has no separate purpose, and the Part 1 ladder is gone
+
+- `DeriveCashAddressNode` is now the literal `m/139'/d1/d2/d3/d4` path LUD-25's
+  text specifies, the same node `DeriveCashDomainNode` returns, not a separate
+  `m/139'/1'` sub-purpose. `DeriveNostrAddressNode` inherits it. The earlier
+  hop only existed to dodge a collision with a now-removed Part 1
+  seed-derivation extension that was never part of the spec.
+- `DeriveCashSecret`, `CashSecretAt` and `CashSecretSource` are removed along
+  with that extension (`lnurl-wallet#166`); Part 1 notes are plain randomness,
+  as LUD-25's own text always specified. `SecretSource` and the legacy
+  `DeriveNoteRoot`/`DeriveNoteSecret` scheme are unchanged.
+- Checked against an independent `lnurl-wallet` value on the literal path as
+  well as the conformance vectors.
+
 ## 0.1.0 — 2026-09-15
 
 ### Reference address proofs and compact note URLs

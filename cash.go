@@ -1,13 +1,13 @@
 package lnurlcash
 
-// LUD-25 seed-recoverable note secrets: the specified scheme.
-//
-// LUD-25's "Seed-recoverable note secrets" section, in full:
+// LUD-25's m/139' branch derivation: the BIP-32 walk from a wallet's cash root
+// down to a per-service domain node, exactly as Part 2's "Seed & derivation"
+// section specifies it:
 //
 //	cashHashingKey   = derive(masterKey, m/139'/0)
 //	domainMaterial   = hmacSha256(cashHashingKey, full SERVICE domain)
 //	(d1, d2, d3, d4) = first 16 bytes of domainMaterial as 4 uint32
-//	secret_i         = derive(masterKey, m/139'/d1/d2/d3/d4/i')
+//	domainNode       = derive(masterKey, m/139'/d1/d2/d3/d4)
 //
 // "exactly as LUD-05", says the draft of the middle two lines, and that
 // reference settles the one thing the path shape leaves open. d1..d4 are raw
@@ -15,17 +15,23 @@ package lnurlcash
 // hardened, so roughly half of any given mint's four levels are hardened by
 // magnitude alone. They are used exactly as they fall: nothing is masked, and
 // nothing is forced hardened. That is what LUD-05's own corpus does with the
-// same four longs, and what the reference wallet does. Only i is deliberately
-// hardened, by the spec's own i'.
+// same four longs, and what the reference wallet does.
 //
 // An implementation that masks the top bit, or hardens all four, derives a
 // different tree from every conforming wallet - and a restore against it finds
 // nothing, silently, and only once the money is gone.
 //
-// This is NOT the scheme in secrets.go's DeriveNoteRoot. That one (HMAC-SHA256
-// under "lnurlcash-note-v1") predates this section and is now the legacy
-// scheme: still derived, still scanned on restore, so nothing already minted
-// goes missing, but not what a new wallet should mint under.
+// Part 1 secrets are NOT derived from this node, or from the seed at all -
+// Part 1's own text has the wallet generate plain randomness. An earlier
+// reference-wallet extension did derive Part 1 secrets deterministically from
+// this node, hardened at the note's own index; it has since been dropped as
+// unspecified, and this package no longer provides it. secrets.go's legacy
+// scheme (HMAC-SHA256 under "lnurlcash-note-v1", predating LUD-25 entirely) is
+// still derived and still scanned on restore, so nothing already minted under
+// it goes missing.
+//
+// Part 2's address branch is this exact domain node, for the same host: see
+// DeriveCashAddressNode.
 
 import (
 	"crypto/hmac"
@@ -166,19 +172,12 @@ func CashDomainIndices(root CashNode, host string) ([4]uint32, error) {
 	return out, nil
 }
 
-// DeriveCashDomainNode returns m/139'/d1/d2/d3/d4 for one mint: everything
-// above a note's own index.
+// DeriveCashDomainNode returns m/139'/d1/d2/d3/d4 for one mint: Part 2's
+// address branch, which DeriveCashAddressNode returns too.
 //
-// Worth having as its own step, and not only to derive it once for a run of
-// secrets. Every unhardened level in the path is at or above this node, so a
-// signer given THIS rather than the seed needs no elliptic curve at all - each
-// i' beneath it is HMAC-SHA512 plus one modular addition. That is the
-// difference between a hardware wallet that can do LUD-25 recovery and one
-// that would need secp256k1 added to its firmware for it.
-//
-// The cost is that whoever derives it can derive every note secret the wallet
-// will ever hold AT THIS MINT, so it is provisioning material rather than
-// something to hand out: one mint's subtree, not the wallet.
+// Whoever holds it can derive every note key the wallet will ever hold AT THIS
+// MINT, so it is provisioning material rather than something to hand out: one
+// mint's subtree, not the wallet. Hand out CashNodeToCx1 of it instead.
 //
 // host is the mint host exactly as the wallet stores it - lowercase, port
 // included where there is one - which is what the reference wallet passes, so
@@ -195,39 +194,6 @@ func DeriveCashDomainNode(root CashNode, host string) (CashNode, error) {
 		}
 	}
 	return node, nil
-}
-
-func requireIndex(index uint32) error {
-	if index >= hardened {
-		return &ProtocolError{Detail: fmt.Sprintf("a note index must be below 2^31, not %d", index)}
-	}
-	return nil
-}
-
-// CashSecretAt returns the i-th note secret beneath a mint's domain node, as
-// 32 bytes of hex - the size of a payment preimage, so HashK1 and every wire
-// path treat it exactly as they treat a randomly drawn one. The service sees
-// no difference: it only ever receives sha256(k1).
-func CashSecretAt(domainNode CashNode, index uint32) (string, error) {
-	if err := requireIndex(index); err != nil {
-		return "", err
-	}
-	leaf, err := DeriveCashChild(domainNode, index+hardened)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(leaf.PrivateKey[:]), nil
-}
-
-// DeriveCashSecret is the convenience form, from the root. It re-derives the
-// domain node on every call, which is up to four point multiplications - fine
-// for one secret, wasteful for a run of them. Use CashSecretSource for those.
-func DeriveCashSecret(root CashNode, host string, index uint32) (string, error) {
-	node, err := DeriveCashDomainNode(root, host)
-	if err != nil {
-		return "", err
-	}
-	return CashSecretAt(node, index)
 }
 
 // CashNodeToHex renders a node as privateKey || chainCode, 64 bytes of hex.
@@ -256,56 +222,4 @@ func CashNodeFromHex(value string) (CashNode, error) {
 		return CashNode{}, &ProtocolError{Detail: "that cash node holds an invalid private key"}
 	}
 	return out, nil
-}
-
-// CashSecretSource walks a mint's indices in order, so a caller can hand it to
-// any mutating call and let rotate, split and merge draw derived secrets
-// without knowing anything about derivation. NextIndex reads back the next
-// unused index afterwards - a split consumes two, a rotate one - which is the
-// number the wallet persists as its counter for that host. The domain node is
-// derived once, in NewCashSecretSource, rather than per secret.
-//
-// Persist that counter in the SAME write that stages the new records, and do
-// it BEFORE the hash goes on the wire. A crash between the bump and the
-// request wastes an index, which costs nothing; a crash the other way round
-// re-derives a secret the mint has already seen, and the second note minted at
-// it collides with the first.
-//
-// The counter is not secret - an index reveals nothing without the root - so
-// it belongs in an ordinary backup, and a restore should merge counters
-// upwards only. It is also not optional: a gap scan cannot see a burned index
-// (LUD-25 requires a hash lookup to answer for a spent note exactly as it
-// answers for one that never existed), so a wallet that has rotated more times
-// than its gap limit cannot rediscover its own position from the mint alone.
-type CashSecretSource struct {
-	domainNode CashNode
-	next       uint32
-}
-
-// NewCashSecretSource derives the mint's domain node once and starts at start.
-func NewCashSecretSource(root CashNode, host string, start uint32) (*CashSecretSource, error) {
-	if err := requireIndex(start); err != nil {
-		return nil, err
-	}
-	node, err := DeriveCashDomainNode(root, host)
-	if err != nil {
-		return nil, err
-	}
-	return &CashSecretSource{domainNode: node, next: start}, nil
-}
-
-// Next returns the next secret and advances the counter. It satisfies
-// SecretSource.
-func (s *CashSecretSource) Next() (string, error) {
-	secret, err := CashSecretAt(s.domainNode, s.next)
-	if err != nil {
-		return "", err
-	}
-	s.next++
-	return secret, nil
-}
-
-// NextIndex is the next unused index - what the wallet persists.
-func (s *CashSecretSource) NextIndex() uint32 {
-	return s.next
 }

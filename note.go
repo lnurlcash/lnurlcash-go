@@ -59,7 +59,7 @@ func NoteSignature(rawURL string) string {
 // ResolveNoteInput resolves input to a note URL, or "" if it is not one.
 //
 // Input only qualifies if it carries a well-formed k1: 32 bytes hex, or a Part 2
-// ck1 that recovers to a key. Anything else would fail during hashing later, so
+// ck1 with a valid key/signature pair. Anything else would fail during hashing later, so
 // it is refused at the door.
 func ResolveNoteInput(value string) string {
 	resolved := ResolveLnurlInput(value)
