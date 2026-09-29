@@ -12,7 +12,7 @@ idempotent request sent on a REUSED connection, and a client with no Transport
 uses the process-wide http.DefaultTransport pool.
 
 LUD-25 closed this at the service end: a service MUST answer a byte-identical
-retried rotate/split/merge with the success it already returned, sig and sig2
+retried rotate/split/merge with the success it already returned, c and c2
 included where it gave any.
 So Client re-sends a mutation whose answer was lost, on purpose and bounded
 (Client.MutationRetries; 0 means the default of one extra attempt, negative
@@ -29,7 +29,7 @@ caller-supplied *http.Client SHOULD do the same.
 
 ## CRITICAL: every note is a taproot output key Q
 
-LUD-25 (luds 6e865b1): a note is a BIP-341 output key Q, named cp1<Q>, filed
+LUD-25 (luds 50d740a): a note is a BIP-341 output key Q, named cp1<Q>, filed
 by the mint under hex(Q). A k1 is a SPEND of it:
   64 hex    a bearer note's preimage: short form of the cw1 for the leaf
             OP_SHA256 <h> OP_EQUAL under the BIP-341 NUMS key. Signs nothing,
@@ -51,7 +51,7 @@ accepts an uncertified output named by a bearer h; a received certificate is
 passed through.
 
 An output named by a cp1 (p1, or p2 for a split's change) is owed its cs1 in
-sig (sig2 for the change) ALWAYS, whatever the Policy - this package's rule,
+c (c2 for the change) ALWAYS, whatever the Policy - this package's rule,
 stricter than LUD-25's SHOULD. Without it ParseMutation returns
 *UnverifiableError. That error means the mutation LANDED, so the note is REAL
 - persist NewSecrets(err) before anything else (empty from the *WithHash
@@ -126,10 +126,12 @@ Key-path notes (recoverable.go):
 DeriveCashAddressNode(root, host) -> CashNode  m/139'/d1/d2/d3/d4, hashing key
   m/139'/0: the spec's literal path, the same node DeriveCashDomainNode returns
 CashNodeToCx1(node) -> Cx1{PubkeyXOnly, ChainCode}  watch-only; links the branch
-DeriveNotePubkey(branchX, chainCode, i) -> [32]byte  Q, used as is (no BIP-86
-  tweak); watch-only; i any uint32
-DeriveNoteSecretKey(branchKey, chainCode, i) -> [32]byte  negates an odd branch
-  key first. t = tagged_hash("LNURLcash/derive", P || cc || ser32_be(i));
+DeriveNotePubkey(branchX, chainCode, purpose, i) -> [32]byte  Q, used as is (no
+  BIP-86 tweak); watch-only; i any uint32. purpose: NotePurposeWallet (0, also
+  a split's p1 and the address proof key at index 0), NotePurposeChange (1, a
+  split's p2), NotePurposeLightningAddress (2, auto-mint and internal transfer)
+DeriveNoteSecretKey(branchKey, chainCode, purpose, i) -> [32]byte  negates an odd branch
+  key first. t = tagged_hash("LNURLcash/derive", P || cc || ser32_be(purpose) || ser32_be(i));
   t is reduced mod n; a key at zero is an ERROR (use the next index)
 SignNoteOwnership(sk, domain) -> [96]byte  Q || BIP-340 sig over
   KeyPathSighash(Q, domain), zero aux_rand: one deterministic ck1 per mint

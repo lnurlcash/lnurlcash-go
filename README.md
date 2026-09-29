@@ -242,11 +242,26 @@ node, _ := lnurlcash.DeriveCashAddressNode(root, "mint.example") // m/139'/d1/d2
 cx, _ := lnurlcash.CashNodeToCx1(node)
 cx1 := lnurlcash.EncodeCx1(cx.PubkeyXOnly, cx.ChainCode)          // watch-only
 
-pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, i) // Q, used as is
-sk, _ := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, i)
+pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, lnurlcash.NotePurposeWallet, i) // Q, used as is
+sk, _ := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, lnurlcash.NotePurposeWallet, i)
 payload, _ := lnurlcash.SignNoteOwnership(sk, "mint.example")        // Q || sig, 96 bytes
 ck1 := lnurlcash.EncodeCk1(payload)                                   // spends at mint.example only
 ```
+
+The purpose splits a branch into three independent counters, so a wallet's own
+indices and a service's auto-minted ones never collide, and each kind of note
+can be restored on its own: `NotePurposeWallet` (0) for every note the wallet
+mints, rotates or merges into, a split's `p1`, and the index-0 key that proves
+an address registration; `NotePurposeChange` (1) for a split's change `p2`;
+`NotePurposeLightningAddress` (2) for notes credited by Lightning Address
+auto-mint or an internal transfer. `i` counts per purpose, per service.
+
+Certificates travel as `c` (`c2` for a split's change), and a certified note
+URL as `&c=<cs1>`. The earlier `sig`, `sig2` and `&sig=` are still read, never
+written; the registration-proof request parameter stays `sig`. A payRequest's
+internal-transfer hint is the `text/cpub` metadata entry (formerly `text/xpub`);
+this module does not parse payRequest metadata, so a caller reading it should
+accept both.
 
 All-zero `aux_rand` makes a `ck1` a deterministic function of the key and the
 domain, so seed recovery reproduces it byte for byte. `ck1`s signed before

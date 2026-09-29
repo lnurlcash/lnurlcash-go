@@ -104,7 +104,7 @@ echoed `k1` is the one queried, or another spend that opens the same `Q` at
 that mint. Anything else means either a non-compliant service or a note
 redeemed by somebody else.
 
-**A secret leaking through a query string.** `sig` is stripped before the
+**A secret leaking through a query string.** The certificate (`c`, or the legacy `sig`) is stripped before the
 informational GET, since the service already knows what it signed.
 
 **A hostile fee advertisement.** Fees of 100% or more are refused at parse

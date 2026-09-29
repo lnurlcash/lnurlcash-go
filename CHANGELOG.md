@@ -8,6 +8,27 @@ carry breaking changes; pin an exact version.
 **Breaking.** All four changes below alter public signatures or derived
 values, and a `ck1`/`cx1` produced by 0.1.0 is not what this version produces.
 
+### Derivation purposes, `c`/`c2` and `text/cpub` (LUD-25 `50d740a`)
+
+**Breaking.** Note keys derived by earlier builds are not what this version
+derives, and the derivation functions take a purpose. Graded against the
+`lnurlcash-conformance` 0.15.0 vectors, which also carry the superseded
+scheme as a negative.
+
+- The note tweak is `t = tagged_hash("LNURLcash/derive", P || chaincode ||
+  ser32(purpose) || ser32(i)) mod n`. `DeriveNotePubkey` and
+  `DeriveNoteSecretKey` take `purpose` before `i`, with the constants
+  `NotePurposeWallet` (0: wallet notes, a split's `p1`, the address proof key
+  at index 0), `NotePurposeChange` (1: a split's `p2`) and
+  `NotePurposeLightningAddress` (2: auto-mint and internal transfer).
+- Certificates are `c` (and `c2` for a split's change) in withdraw responses
+  and on the informational GET, and a certified note URL carries `&c=`. New
+  URLs and rewrites emit `c`; the legacy `sig`, `sig2` and `&sig=` are still
+  read. The registration-proof request parameter stays `sig`.
+- The internal-transfer hint is `text/cpub` (formerly `text/xpub`). This module
+  does not parse payRequest metadata, so there is no code change; callers
+  should accept both.
+
 ### Every note is a taproot output key (LUD-25 `6e865b1`)
 
 LUD-25's unified taproot model (luds `6e865b1`, "unified taproot
