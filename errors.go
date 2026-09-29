@@ -3,22 +3,24 @@
 // A bearer note is an ordinary LUD-03 withdrawRequest link whose k1 IS the
 // asset:
 //
-//	lnurlw://mint.example/w?k1=<secret>&amount=<msat>
+//	lnurlw://mint.example/w?k1=<spend>&amount=<msat>
 //
 // Whoever knows the k1 controls the sats behind it, like a banknote. The
 // amount alongside it is only a claim by whoever encoded the note; the
 // authoritative value is always MaxWithdrawable from an informational GET.
 //
-// Every mutating operation is a GET on the callback from that withdrawRequest:
+// Every note is a BIP-341 taproot output key Q, named cp1<Q>, and k1 is a
+// spend of it (see spend.go): a ck1 signed by Q for this mint, a cw1 opening a
+// leaf of Q's script tree, or a bearer note's 64-hex preimage, the short form
+// of the cw1 for its OP_SHA256 <h> OP_EQUAL leaf.
 //
-//	callback?k1=X&pr=<bolt11>              melt
-//	callback?k1=X&h=<sha256(X')>           rotate
-//	callback?k1=X&amount=<msat>&h=..&h2=.. split
-//	callback?k1=X&k1=Y&h=<sha256(Z)>       merge
+// Every mutating operation is a GET on the callback from that withdrawRequest,
+// each output named by a cp1 or a bearer note's hex h:
 //
-// A LUD-25 Part 2 note is keyed by a public key instead (see recoverable.go):
-// it goes in k1 as a ck1, and an output minted to a key goes as p1=<cp1> - p2
-// for a split's change - in place of h and h2.
+//	callback?k1=X&pr=<bolt11>                melt
+//	callback?k1=X&p1=<cp1 or h>              rotate
+//	callback?k1=X&amount=<msat>&p1=..&p2=..  split
+//	callback?k1=X&k1=Y&p1=<cp1 or h>         merge
 //
 // Amounts are int64 milli-satoshis, everywhere, with no exceptions.
 //
@@ -45,8 +47,8 @@ import (
 //	                    processed. Nothing may be assumed either way.
 //	ProtocolError       a non-mutating response did not match the spec.
 //	UnverifiableError   a MUTATION landed and an output came back without the
-//	                    signature it is owed: always a cp1's certificate. The
-//	                    note exists; it just cannot be verified offline.
+//	                    certificate it is owed. The note exists; it just
+//	                    cannot be verified offline.
 //
 // Treating an ambiguous failure as a definitive one is how wallets lose money:
 // a rotate that times out after the service burned the input has already
@@ -63,6 +65,13 @@ var (
 	// until that resolves. Retry shortly - never read this as spent.
 	ErrNotePending = errors.New("this note has another operation in progress - try again in a moment")
 )
+
+// ErrOutputInUse is LUD-25's {"status":"ERROR","reason":"already in use"}
+// case: an output this request named, p1 or p2, is already outstanding or was
+// burned before, so the service refused rather than credit value into a note
+// somebody else may hold the spend for. Nothing was burned. Name a fresh
+// output - the next index, for a key derived from a branch - and try again.
+var ErrOutputInUse = errors.New("an output this request named is already in use - name a fresh one")
 
 // ProtocolError is a non-mutating response that does not match the protocol.
 type ProtocolError struct {
@@ -86,6 +95,10 @@ type ServiceError struct {
 	// Unknown is true when the service does not recognise the k1 at all.
 	// Distinct from Spent: nothing here proves the holder's copy was ever real.
 	Unknown bool
+	// OutputInUse is true for LUD-25's "already in use": an output the
+	// request named is taken, and nothing was burned. errors.Is(err,
+	// ErrOutputInUse) says the same.
+	OutputInUse bool
 	// NewSecrets are the fresh wallet-generated secrets a MUTATION disclosed
 	// the hashes of, when this refusal is one that could describe a mutation
 	// the service had already applied.
@@ -97,6 +110,11 @@ type ServiceError struct {
 	//
 	// Nil on every other refusal, and on every non-mutating call.
 	NewSecrets []string
+}
+
+// Is lets errors.Is match ErrOutputInUse against the refusal it describes.
+func (e *ServiceError) Is(target error) bool {
+	return target == ErrOutputInUse && e.OutputInUse
 }
 
 func (e *ServiceError) Error() string {
@@ -135,11 +153,12 @@ func (e *AmbiguousError) Error() string { return e.Detail }
 func (e *AmbiguousError) Unwrap() error { return e.Cause }
 
 // UnverifiableError means the service confirmed a rotate, split or merge with
-// {"status":"OK"} but returned no certificate for a cp1 output it minted.
-// LUD-25 Part 2 requires a cs1 on every one, so this is a non-conforming
-// service - but the mutation LANDED. The note exists, at the key or hash the
-// caller disclosed, and whatever is behind it is the only key to that value
-// anywhere.
+// {"status":"OK"} but returned no certificate for an output it was owed one
+// for. LUD-25 says a service SHOULD certify every note; this package insists
+// for an output named by cp1, since offline verification is the reason to
+// name it so - but the mutation LANDED. The note exists, at the key or hash
+// the caller disclosed, and whatever is behind it is the only key to that
+// value anywhere.
 //
 // So this is an error about the note's VERIFIABILITY, never about its
 // existence, and it carries the secrets for the same reason AmbiguousError
@@ -147,9 +166,9 @@ func (e *AmbiguousError) Unwrap() error { return e.Cause }
 // conformance. Persist them, then decide whether to keep dealing with a mint
 // that issues notes nobody can check.
 //
-// Raised for a cp1 output whatever the Policy says. A legacy hash output raises
-// it when Policy.RequireSignatures asked for the raw Part 1 signature and a
-// no-signer mint omitted it.
+// Raised for an output named by cp1 whatever the Policy says. One named by a
+// bearer note's hex h raises it when Policy.RequireSignatures asked for a
+// certificate and a mint with no signer omitted it.
 type UnverifiableError struct {
 	Detail string
 	// NewSecrets, as AmbiguousError - and more important here, because the note
@@ -219,6 +238,11 @@ func classifyNoteError(reason string) error {
 	lowered := strings.ToLower(reason)
 	if lowered == "pending" {
 		return ErrNotePending
+	}
+	// LUD-25 says exactly "already in use"; lnurl-mint says "Output already
+	// in use.", so it is matched as a phrase, as lnurl-wallet does
+	if strings.Contains(lowered, "already in use") {
+		return &ServiceError{Reason: reason, OutputInUse: true}
 	}
 	if strings.Contains(lowered, "spent") {
 		return &ServiceError{Reason: reason, Spent: true}

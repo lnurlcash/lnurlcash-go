@@ -8,12 +8,14 @@ package lnurlcash_test
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -239,11 +241,12 @@ func TestRotateBurnsTheOldSecretAndMintsOneTheServiceNeverSaw(t *testing.T) {
 	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
 		t.Fatalf("output state = %s", state)
 	}
-	if !lnurlcash.VerifyNoteSignature(rotated.K1, 21000, rotated.Signature, mint.pubkey) {
-		t.Fatal("the signature does not verify")
+	// the mint certifies the bearer note it minted over hex(Q)
+	if got := lnurlcash.VerifyNoteSignature(rotated.K1, mint.url, 21000, rotated.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the certificate = %v", got)
 	}
-	if lnurlcash.VerifyNoteSignature(rotated.K1, 21001, rotated.Signature, mint.pubkey) {
-		t.Fatal("a signature verified for an amount the mint never signed")
+	if got := lnurlcash.VerifyNoteSignature(rotated.K1, mint.url, 21001, rotated.Signature, mint.pubkey); got != lnurlcash.NotCertified {
+		t.Fatalf("a certificate verified for an amount the mint never signed: %v", got)
 	}
 }
 
@@ -257,8 +260,8 @@ func TestAcceptsTheOtherRecoveryIDLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-	if !lnurlcash.VerifyNoteSignature(rotated.K1, 21000, rotated.Signature, mint.pubkey) {
-		t.Fatal("a recovery-id-leading signature did not verify")
+	if got := lnurlcash.VerifyNoteSignature(rotated.K1, mint.url, 21000, rotated.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("a recovery-id-leading certificate = %v", got)
 	}
 }
 
@@ -301,8 +304,11 @@ func TestSplitProducesAnAmountAndItsChange(t *testing.T) {
 			t.Fatalf("output %s = %d (%v), want %d", k1[:8], info.MaxWithdrawableMsat, err, want)
 		}
 	}
-	if !lnurlcash.VerifyNoteSignature(split.K1, 5000, split.Signature, mint.pubkey) {
-		t.Fatal("the split note's signature does not verify")
+	if got := lnurlcash.VerifyNoteSignature(split.K1, mint.url, 5000, split.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the split note's certificate = %v", got)
+	}
+	if got := lnurlcash.VerifyNoteSignature(split.Change, mint.url, 16000, split.ChangeSignature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the change's certificate = %v", got)
 	}
 }
 
@@ -882,11 +888,15 @@ func TestALyingServiceCannotInflatePastWhatItSigned(t *testing.T) {
 	}
 	// the signature was issued over the true amount, so an offline holder catches
 	// the inflation without asking anyone
-	if lnurlcash.VerifyNoteSignature(k1, info.MaxWithdrawableMsat, signature, mint.pubkey) {
-		t.Fatal("an inflated amount verified")
+	if got := lnurlcash.VerifyNoteSignature(k1, mint.url, info.MaxWithdrawableMsat, signature, mint.pubkey); got != lnurlcash.NotCertified {
+		t.Fatalf("an inflated amount verified: %v", got)
 	}
-	if !lnurlcash.VerifyNoteSignature(k1, 21000, signature, mint.pubkey) {
-		t.Fatal("the true amount did not verify")
+	if got := lnurlcash.VerifyNoteSignature(k1, mint.url, 21000, signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the true amount = %v", got)
+	}
+	// and the certificate the lookup hands out says the same
+	if got := lnurlcash.VerifyNoteSignature(k1, mint.url, info.MaxWithdrawableMsat, info.Signature, mint.pubkey); got != lnurlcash.NotCertified {
+		t.Fatalf("the lookup's own certificate vouched for the inflated amount: %v", got)
 	}
 }
 
@@ -1018,5 +1028,174 @@ func TestWhatAMintSaysItOwesKeepsZeroDistinctFromSilence(t *testing.T) {
 	}
 	if text := mintAddressBody(t, map[string]any{"outstandingNotesMsat": "48000"}).OutstandingNotesMsat; text != nil {
 		t.Fatalf("outstanding = %v, want nil", text)
+	}
+}
+
+// ---- notes keyed by Q, at the mock mint ----
+//
+// The mock mint keys every note by hex(Q), verifies every spend in full (a ck1
+// against the hostname it was reached at, 127.0.0.1 here), and certifies every
+// note with a cs1 over hex(Q).
+
+// testKey is a note key made for these tests alone, with its cp1 and the ck1
+// that spends it at mint.
+func testKey(t *testing.T, label string, mint *mockMint) (secretKey [32]byte, cp1, ck1 string) {
+	t.Helper()
+	secretKey = sha256.Sum256([]byte("lnurlcash-go test key " + label))
+	var q [32]byte
+	copy(q[:], publicKeyOf(t, secretKey)[1:])
+	payload, err := lnurlcash.SignNoteOwnership(secretKey, mint.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return secretKey, lnurlcash.EncodeCp1(q), lnurlcash.EncodeCk1(payload)
+}
+
+func TestAKeyPathNoteRoundTripsAtTheMint(t *testing.T) {
+	mint := startMint(t)
+	client := lnurlcash.NewClient()
+	_, cp1, ck1 := testKey(t, "a", mint)
+	mint.credit(t, ck1, 21000)
+
+	// the lookup verifies the spend, echoes it, and hands out the certificate
+	info, err := client.FetchNoteInfo(ctx(t), mint.noteURL(ck1))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if info.K1 != ck1 || info.MaxWithdrawableMsat != 21000 {
+		t.Fatalf("info = %+v", info)
+	}
+	if got := lnurlcash.VerifyNoteSignature(ck1, mint.url, 21000, info.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the lookup's certificate = %v", got)
+	}
+	// looked up by its cp1, the spend never leaves this process
+	byKey, err := client.FetchNoteInfoByHash(ctx(t), mint.url+"/w", cp1)
+	if err != nil || byKey.MaxWithdrawableMsat != 21000 || byKey.Signature != info.Signature {
+		t.Fatalf("lookup by cp1 = %+v (%v)", byKey, err)
+	}
+
+	// rotate into another key; the output comes back certified
+	_, cp1B, ck1B := testKey(t, "b", mint)
+	mutation, err := client.RotateNoteWithHash(ctx(t), mint.callback(), ck1, cp1B)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if state := mint.noteState(t, ck1); state != "burned" {
+		t.Fatalf("input state = %s", state)
+	}
+	if got := lnurlcash.VerifyNoteSignature(ck1B, mint.url, 21000, mutation.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the rotated note's certificate = %v", got)
+	}
+
+	// and back out to a bearer note this client draws
+	rotated, err := client.RotateNote(ctx(t), mint.callback(), ck1B)
+	if err != nil {
+		t.Fatalf("rotate to a bearer note: %v", err)
+	}
+	if got := lnurlcash.VerifyNoteSignature(rotated.K1, mint.url, 21000, rotated.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+		t.Fatalf("the bearer note's certificate = %v", got)
+	}
+}
+
+func TestACk1ForAnotherMintOpensNothing(t *testing.T) {
+	mint := startMint(t)
+	client := lnurlcash.NewClient()
+	key, _, ck1 := testKey(t, "c", mint)
+	mint.credit(t, ck1, 21000)
+
+	payload, err := lnurlcash.SignNoteOwnership(key, "elsewhere.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := lnurlcash.EncodeCk1(payload)
+	if _, err := client.FetchNoteInfo(ctx(t), mint.noteURL(foreign)); !lnurlcash.IsUnknownNote(err) {
+		t.Fatalf("the lookup = %v, want unknown", err)
+	}
+	if _, err := client.RotateNote(ctx(t), mint.callback(), foreign); err == nil || lnurlcash.IsAmbiguous(err) {
+		t.Fatalf("the rotate = %v, want refused", err)
+	}
+	if state := mint.noteState(t, ck1); state != "outstanding" {
+		t.Fatalf("the note is %s after a foreign spend was refused", state)
+	}
+	// and this package would not have let it through the door either
+	if lnurlcash.ResolveNoteInput(mint.noteURL(foreign)) != "" {
+		t.Error("a note URL carrying another mint's ck1 resolved")
+	}
+}
+
+func TestABearerNoteSpendsByItsFullCw1(t *testing.T) {
+	mint := startMint(t)
+	client := lnurlcash.NewClient()
+	preimage := secret(31)
+	mint.credit(t, preimage, 21000)
+	cw1, err := lnurlcash.BearerCw1(preimage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := client.FetchNoteInfo(ctx(t), mint.noteURL(cw1))
+	if err != nil || info.MaxWithdrawableMsat != 21000 {
+		t.Fatalf("fetch by cw1 = %+v (%v)", info, err)
+	}
+	// the certificate names the note, not the spelling of its spend
+	for _, spend := range []string{preimage, cw1} {
+		if got := lnurlcash.VerifyNoteSignature(spend, mint.url, 21000, info.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+			t.Fatalf("%.12s...'s certificate = %v", spend, got)
+		}
+	}
+	// looked up by its h, the short form of its cp1
+	h, _ := lnurlcash.HashK1(preimage)
+	if byHash, err := client.FetchNoteInfoByHash(ctx(t), mint.url+"/w", h); err != nil || byHash.MaxWithdrawableMsat != 21000 {
+		t.Fatalf("lookup by h = %+v (%v)", byHash, err)
+	}
+	rotated, err := client.RotateNote(ctx(t), mint.callback(), cw1)
+	if err != nil {
+		t.Fatalf("rotate by cw1: %v", err)
+	}
+	if state := mint.noteState(t, preimage); state != "burned" {
+		t.Fatalf("the note is %s after its cw1 spent it", state)
+	}
+	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
+		t.Fatalf("output state = %s", state)
+	}
+}
+
+func TestAnOutputAlreadyInUseIsRefusedAndBurnsNothing(t *testing.T) {
+	mint := startMint(t)
+	client := lnurlcash.NewClient()
+	input, taken := secret(32), secret(33)
+	mint.credit(t, input, 21000)
+	mint.credit(t, taken, 1000)
+	takenH, _ := lnurlcash.HashK1(taken)
+
+	_, err := client.RotateNoteWithHash(ctx(t), mint.callback(), input, takenH)
+	if !errors.Is(err, lnurlcash.ErrOutputInUse) {
+		t.Fatalf("rotating into a live note = %v, want already in use", err)
+	}
+	if lnurlcash.IsSpent(err) || lnurlcash.IsAmbiguous(err) || len(lnurlcash.NewSecrets(err)) != 0 {
+		t.Errorf("already in use read as something that may have burned: %v", err)
+	}
+	if state := mint.noteState(t, input); state != "outstanding" {
+		t.Fatalf("the input is %s after a refused rotate", state)
+	}
+	// the same output named by its cp1 is the same note, and just as taken
+	takenQ, _ := lnurlcash.BearerNoteID(takenH)
+	if _, err := client.RotateNoteWithHash(ctx(t), mint.callback(), input, lnurlcash.EncodeCp1(hex32(t, takenQ))); !errors.Is(err, lnurlcash.ErrOutputInUse) {
+		t.Fatalf("rotating into a live note's cp1 = %v, want already in use", err)
+	}
+}
+
+// lnurl-mint words the refusal "Output already in use." rather than the
+// spec's exact "already in use"; a wallet retrying at its next index must
+// recognise both.
+func TestLnurlMintsWordingOfAlreadyInUse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ERROR","reason":"Output already in use."}`)
+	}))
+	t.Cleanup(server.Close)
+	takenH, _ := lnurlcash.HashK1(secret(33))
+	_, err := lnurlcash.NewClient().RotateNoteWithHash(ctx(t), server.URL+"/w/cb", secret(32), takenH)
+	if !errors.Is(err, lnurlcash.ErrOutputInUse) {
+		t.Fatalf("lnurl-mint's refusal = %v, want already in use", err)
 	}
 }

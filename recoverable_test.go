@@ -1,8 +1,10 @@
 package lnurlcash_test
 
-// Part 2 behaviour the vectors do not state on their own: which parameter each
-// call puts a ck1 or a cp1 in, and what is refused before anything is sent.
-// Every key and signature here is one of part2.json's, so nothing is invented.
+// Key-path note behaviour the vectors do not state on their own: which
+// parameter each call puts a spend or an output in, which older ck1s are still
+// read, and what is refused before anything is sent. Every key and signature
+// here is one of part2.json's, whose first branch is at mint.example, or is
+// made from one of its keys.
 
 import (
 	"context"
@@ -20,6 +22,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -28,6 +32,7 @@ import (
 
 type part2Sample struct {
 	a, b, c    part2Note
+	domain     string
 	cs1        string
 	mintPubkey string
 	cx1        string
@@ -42,6 +47,7 @@ func loadPart2(t *testing.T) part2Sample {
 		a:          notes[0],
 		b:          notes[1],
 		c:          notes[2],
+		domain:     vectors.Branches[0].Domain,
 		cs1:        vectors.Certificates[0].Cs1,
 		mintPubkey: vectors.Mint.MintPubkey,
 		cx1:        vectors.Branches[0].Cx1,
@@ -57,16 +63,25 @@ func queryOf(t *testing.T, raw string) url.Values {
 	return parsed.Query()
 }
 
-func TestNoteIDOfFilesEitherKindOfNote(t *testing.T) {
+func TestNoteIDOfFilesEveryNoteByItsQ(t *testing.T) {
 	part2 := loadPart2(t)
 	k1 := secret(0x11)
 	hash, _ := lnurlcash.HashK1(k1)
+	q, _ := lnurlcash.BearerNoteID(hash)
+	cw1, _ := lnurlcash.BearerCw1(k1)
 
-	if id, err := lnurlcash.NoteIDOf(k1); err != nil || id != hash {
-		t.Errorf("a Part 1 secret is filed under %s (%v), want its hash %s", id, err, hash)
+	// a bearer preimage and its cw1 are one spend of one note, filed by hex(Q)
+	for _, spend := range []string{k1, strings.ToUpper(k1), cw1} {
+		if id, err := lnurlcash.NoteIDOf(spend); err != nil || id != q {
+			t.Errorf("%.12s... is filed under %s (%v), want hex(Q) %s", spend, id, err, q)
+		}
 	}
+	// looked up by its short form, which every mint reads, or by its cp1
 	if lookup, err := lnurlcash.NoteLookupOf(k1); err != nil || lookup != hash {
-		t.Errorf("a Part 1 secret is looked up by %s (%v), want its hash", lookup, err)
+		t.Errorf("a bearer preimage is looked up by %s (%v), want its h", lookup, err)
+	}
+	if lookup, err := lnurlcash.NoteLookupOf(cw1); err != nil || lookup != lnurlcash.EncodeCp1(hex32(t, q)) {
+		t.Errorf("a bearer cw1 is looked up by %s (%v), want its cp1", lookup, err)
 	}
 	if id, err := lnurlcash.NoteIDOf(part2.a.Ck1); err != nil || id != part2.a.NotePubkey {
 		t.Errorf("a ck1 is filed under %s (%v), want its key", id, err)
@@ -105,17 +120,25 @@ func TestTheSignedMessageNamesAPart2NoteByItsKey(t *testing.T) {
 
 func TestANoteURLCarryingACk1IsANote(t *testing.T) {
 	part2 := loadPart2(t)
-	note := "https://mint.example/w?k1=" + part2.a.Ck1 + "&amount=21000&sig=" + part2.cs1
-	if got := lnurlcash.ResolveNoteInput(note); got != note {
-		t.Errorf("resolve = %q, want the note back", got)
+	for _, note := range []string{
+		"https://" + part2.domain + "/w?k1=" + part2.a.Ck1 + "&amount=21000&sig=" + part2.cs1,
+		"lnurlw://" + strings.ToUpper(part2.domain) + "/w?k1=" + part2.a.Ck1,
+	} {
+		if got := lnurlcash.ResolveNoteInput(note); got == "" {
+			t.Errorf("%s did not resolve", note)
+		}
+	}
+	// signed for one mint, it is no note at another
+	if got := lnurlcash.ResolveNoteInput("https://elsewhere.example/w?k1=" + part2.a.Ck1); got != "" {
+		t.Errorf("a ck1 for %s resolved at another mint: %q", part2.domain, got)
 	}
 	// a cp1 is the note's public name, not what spends it
-	if got := lnurlcash.ResolveNoteInput("https://mint.example/w?k1=" + part2.a.Cp1 + "&amount=21000"); got != "" {
+	if got := lnurlcash.ResolveNoteInput("https://" + part2.domain + "/w?k1=" + part2.a.Cp1 + "&amount=21000"); got != "" {
 		t.Errorf("a cp1 in k1 resolved to %q", got)
 	}
 }
 
-func TestLooksAPart2NoteUpByPAndAHashByH(t *testing.T) {
+func TestLooksEveryNoteUpByP(t *testing.T) {
 	part2 := loadPart2(t)
 	hash, _ := lnurlcash.HashK1(secret(0x11))
 	const link = "https://mint.example/w?k1=" + "22" + "&amount=5&sig=ab"
@@ -124,9 +147,10 @@ func TestLooksAPart2NoteUpByPAndAHashByH(t *testing.T) {
 	if byKey.Get("p") != part2.a.Cp1 || byKey.Has("h") {
 		t.Errorf("a cp1 lookup sent %v, want p alone", byKey)
 	}
+	// a bearer note's h is the cp1 slot's short form, and goes in the same place
 	byHash := queryOf(t, lnurlcash.BuildNoteInfoURLByHash(link, hash))
-	if byHash.Get("h") != hash || byHash.Has("p") {
-		t.Errorf("a hash lookup sent %v, want h alone", byHash)
+	if byHash.Get("p") != hash || byHash.Has("h") {
+		t.Errorf("a hash lookup sent %v, want p alone", byHash)
 	}
 	// A lookup exists to disclose as little as possible, amount=0 included:
 	// a strict mint may refuse a placeholder rather than ignore it.
@@ -143,7 +167,7 @@ func TestLooksAPart2NoteUpByPAndAHashByH(t *testing.T) {
 	}
 }
 
-func TestEachMutationOutputGoesUnderTheNameForItsKind(t *testing.T) {
+func TestEveryMutationOutputGoesAsP1OrP2(t *testing.T) {
 	part2 := loadPart2(t)
 	k1 := secret(0x11)
 	hash, _ := lnurlcash.HashK1(k1)
@@ -156,18 +180,18 @@ func TestEachMutationOutputGoesUnderTheNameForItsKind(t *testing.T) {
 	if q := queryOf(t, rotate.URL); q.Get("k1") != part2.a.Ck1 || q.Get("p1") != part2.b.Cp1 || q.Has("h") {
 		t.Errorf("rotate into a key sent %v", q)
 	}
-	// a hash keeps h, which every mint understands
+	// a bearer note's h is the cp1 slot's short form: p1 all the same
 	rotate, _ = lnurlcash.RotateRequestWithHash(callback, part2.a.Ck1, hash)
-	if q := queryOf(t, rotate.URL); q.Get("h") != hash || q.Has("p1") {
+	if q := queryOf(t, rotate.URL); q.Get("p1") != hash || q.Has("h") {
 		t.Errorf("rotate into a hash sent %v", q)
 	}
 
 	split, _ := lnurlcash.SplitRequestWithHash(callback, []string{part2.a.Ck1}, 5000, part2.b.Cp1, hash)
-	if q := queryOf(t, split.URL); q.Get("p1") != part2.b.Cp1 || q.Get("h2") != hash || q.Has("h") || q.Has("p2") {
+	if q := queryOf(t, split.URL); q.Get("p1") != part2.b.Cp1 || q.Get("p2") != hash || q.Has("h") || q.Has("h2") {
 		t.Errorf("split into a key and a hash sent %v", q)
 	}
 	split, _ = lnurlcash.SplitRequestWithHash(callback, []string{part2.a.Ck1}, 5000, hash, part2.b.Cp1)
-	if q := queryOf(t, split.URL); q.Get("h") != hash || q.Get("p2") != part2.b.Cp1 || q.Has("p1") || q.Has("h2") {
+	if q := queryOf(t, split.URL); q.Get("p1") != hash || q.Get("p2") != part2.b.Cp1 || q.Has("h") || q.Has("h2") {
 		t.Errorf("split into a hash and a key sent %v", q)
 	}
 
@@ -200,6 +224,11 @@ func TestMintsToAKeyWithTheCommentAlone(t *testing.T) {
 	if _, err := lnurlcash.MintInvoiceRequestWithHash(pay, 21000, part2.a.Ck1); !errors.Is(err, lnurlcash.ErrRequestRefused) {
 		t.Errorf("minting to a ck1 = %v, want refused before anything was sent", err)
 	}
+	// a cp1 whose key is no curve point is a note nobody could ever spend
+	offCurve := lnurlcash.EncodeCp1([32]byte{31: 5})
+	if _, err := lnurlcash.MintInvoiceRequestWithHash(pay, 21000, offCurve); !errors.Is(err, lnurlcash.ErrRequestRefused) {
+		t.Errorf("minting to an off-curve cp1 = %v, want refused before anything was paid", err)
+	}
 }
 
 // legacyCk1 is the pre-Schnorr spelling of a note's ck1: a 65-byte
@@ -227,22 +256,46 @@ func legacyCk1(t *testing.T, secretKeyHex string) string {
 
 // rawMessageCk1 is part2.json's first note (index 0 of mint.example) as
 // lnurlcash-conformance 0.12.0 spelled it: the same key, but a BIP-340
-// signature over the raw 9-byte "LNURLcash" rather than its sha256 digest.
+// signature over the raw 9-byte "LNURLcash" rather than the spend sighash.
 const rawMessageCk1 = "ck12e7xv2ca3njkjwuun6zm4u4v3ven69hfc33nmaxcemns7g9y7qeklrf8ych23gfjn0zt4k5g6ghfehepjte5ws7gcxqthg8965zfwazua5564jxx4fjwn3a78j2t55y24l03s7ldw2kmn672wrg5xq790yz4088e"
 
-func TestOneKeyReproducesOneCk1(t *testing.T) {
-	part2 := loadPart2(t)
-	key := hex32(t, part2.a.NoteSecretKey)
-	a, err := lnurlcash.SignNoteOwnership(key)
+// digestMessageCk1 is the same note as lnurlcash-conformance 0.13 spelled it,
+// the form current until spends moved onto the sighash: a BIP-340 signature
+// over sha256("LNURLcash"), with all-zero auxiliary input.
+func digestMessageCk1(t *testing.T, secretKeyHex string) string {
+	t.Helper()
+	private, _ := btcec.PrivKeyFromBytes(hexBytes(t, secretKeyHex, 32))
+	digest := sha256.Sum256([]byte("LNURLcash"))
+	signature, err := schnorr.Sign(private, digest[:], schnorr.CustomNonce([32]byte{}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := lnurlcash.SignNoteOwnership(key)
+	var payload [96]byte
+	copy(payload[:32], schnorr.SerializePubKey(private.PubKey()))
+	copy(payload[32:], signature.Serialize())
+	return lnurlcash.EncodeCk1(payload)
+}
+
+func TestOneKeyReproducesOneCk1PerMint(t *testing.T) {
+	part2 := loadPart2(t)
+	key := hex32(t, part2.a.NoteSecretKey)
+	a, err := lnurlcash.SignNoteOwnership(key, part2.domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := lnurlcash.SignNoteOwnership(key, "https://"+strings.ToUpper(part2.domain)+":3338/w")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a != b || lnurlcash.EncodeCk1(a) != part2.a.Ck1 {
 		t.Errorf("signing twice gave %s and %s, want %s both times", lnurlcash.EncodeCk1(a), lnurlcash.EncodeCk1(b), part2.a.Ck1)
+	}
+	elsewhere, err := lnurlcash.SignNoteOwnership(key, "elsewhere.example")
+	if err != nil || elsewhere == a {
+		t.Errorf("one ck1 serves two mints (%v)", err)
+	}
+	if _, err := lnurlcash.SignNoteOwnership(key, ""); err == nil {
+		t.Error("signed a ck1 bound to no mint")
 	}
 }
 
@@ -262,33 +315,64 @@ func TestALegacyCk1StaysReadableForRotation(t *testing.T) {
 	if lookup, err := lnurlcash.NoteLookupOf(legacy); err != nil || lookup != part2.a.Cp1 {
 		t.Errorf("a legacy ck1 is looked up by %s (%v), want its cp1", lookup, err)
 	}
+	// it names no mint, so it reads the same at any, and says it is old
+	for _, domain := range []string{part2.domain, "elsewhere.example"} {
+		verified, err := lnurlcash.VerifySpend(legacy, domain)
+		if err != nil || hex.EncodeToString(verified.OutputKey[:]) != part2.a.NotePubkey || !verified.Legacy {
+			t.Errorf("at %s: %+v (%v), want the note, legacy", domain, verified, err)
+		}
+	}
 }
 
-func TestARawMessageCk1StaysReadableForRotation(t *testing.T) {
+// Both fixed-message ck1s were current once, and notes carrying them are
+// still out there: read them, and say they are old so a wallet rotates them.
+func TestFixedMessageCk1sStayReadableForRotation(t *testing.T) {
 	part2 := loadPart2(t)
-	if rawMessageCk1 == part2.a.Ck1 {
-		t.Fatal("the raw-message spelling is the current one")
+	for name, ck1 := range map[string]string{
+		"raw message":    rawMessageCk1,
+		"sha256 message": digestMessageCk1(t, part2.a.NoteSecretKey),
+	} {
+		if ck1 == part2.a.Ck1 {
+			t.Fatalf("%s: the old spelling is the current one", name)
+		}
+		decoded, err := lnurlcash.DecodeCk1(ck1)
+		if err != nil || decoded.IsLegacy {
+			t.Fatalf("%s: decodes to %+v (%v)", name, decoded, err)
+		}
+		if id, err := lnurlcash.NoteIDOf(ck1); err != nil || id != part2.a.NotePubkey {
+			t.Errorf("%s: filed under %s (%v), want %s", name, id, err, part2.a.NotePubkey)
+		}
+		owner, err := lnurlcash.RecoverNoteOwnershipPubkey(decoded.Bytes(), part2.domain)
+		if err != nil || hex.EncodeToString(owner.PubkeyXOnly[:]) != part2.a.NotePubkey || !owner.Legacy {
+			t.Errorf("%s: verifies as %+v (%v), want the note, legacy", name, owner, err)
+		}
+		// and its signature is not simply accepted for any message: moved onto
+		// another key, it verifies under no scheme
+		other, _ := lnurlcash.DecodeCk1(part2.b.Ck1)
+		moved := decoded.Current
+		copy(moved[:32], other.Current[:32])
+		if _, err := lnurlcash.RecoverNoteOwnershipPubkey(moved[:], part2.domain); err == nil {
+			t.Errorf("%s: the signature verified under another key", name)
+		}
 	}
-	decoded, err := lnurlcash.DecodeCk1(rawMessageCk1)
-	if err != nil || decoded.IsLegacy {
-		t.Fatalf("a raw-message ck1 decodes to %+v (%v)", decoded, err)
+	// the current ck1 is not mistaken for an old one
+	if owner, err := lnurlcash.RecoverNoteOwnershipPubkey(mustCk1(t, part2.a.Ck1), part2.domain); err != nil || owner.Legacy {
+		t.Errorf("the current ck1 = %+v (%v), want current", owner, err)
 	}
-	if id, err := lnurlcash.NoteIDOf(rawMessageCk1); err != nil || id != part2.a.NotePubkey {
-		t.Errorf("a raw-message ck1 is filed under %s (%v), want %s", id, err, part2.a.NotePubkey)
+}
+
+func mustCk1(t *testing.T, value string) []byte {
+	t.Helper()
+	decoded, err := lnurlcash.DecodeCk1(value)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// and its signature is not simply accepted for any message: moved onto
-	// another key, it verifies under neither scheme
-	other, _ := lnurlcash.DecodeCk1(part2.b.Ck1)
-	moved := decoded.Current
-	copy(moved[:32], other.Current[:32])
-	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(moved[:]); err == nil {
-		t.Error("a raw-message signature verified under another key")
-	}
+	return decoded.Bytes()
 }
 
 func TestAnEchoedCk1IsComparedByTheNoteItNames(t *testing.T) {
 	part2 := loadPart2(t)
-	queried := "https://mint.example/w?k1=" + part2.a.Ck1
+	queried := "https://" + part2.domain + "/w?k1=" + part2.a.Ck1
 	answer := func(k1 string) []byte {
 		body, _ := json.Marshal(map[string]any{
 			"tag": "withdrawRequest", "callback": "https://mint.example/w/cb", "k1": k1,
@@ -296,7 +380,7 @@ func TestAnEchoedCk1IsComparedByTheNoteItNames(t *testing.T) {
 		})
 		return body
 	}
-	for _, spelling := range []string{legacyCk1(t, part2.a.NoteSecretKey), rawMessageCk1} {
+	for _, spelling := range []string{legacyCk1(t, part2.a.NoteSecretKey), rawMessageCk1, digestMessageCk1(t, part2.a.NoteSecretKey)} {
 		if _, err := lnurlcash.ParseNoteInfo(answer(spelling), queried, lnurlcash.Policy{}); err != nil {
 			t.Errorf("another spelling of the same note was refused: %v", err)
 		}
@@ -304,6 +388,14 @@ func TestAnEchoedCk1IsComparedByTheNoteItNames(t *testing.T) {
 	var protocol *lnurlcash.ProtocolError
 	if _, err := lnurlcash.ParseNoteInfo(answer(part2.b.Ck1), queried, lnurlcash.Policy{}); !errors.As(err, &protocol) {
 		t.Errorf("a different note's ck1 was accepted as the echo: %v", err)
+	}
+	// the right key under a signature that opens nothing is not the note
+	forged := mustCk1(t, part2.a.Ck1)
+	forged[40] ^= 0xff
+	var payload [96]byte
+	copy(payload[:], forged)
+	if _, err := lnurlcash.ParseNoteInfo(answer(lnurlcash.EncodeCk1(payload)), queried, lnurlcash.Policy{}); !errors.As(err, &protocol) {
+		t.Errorf("a ck1 naming the note under a broken signature was accepted as the echo: %v", err)
 	}
 }
 
@@ -325,7 +417,7 @@ func TestPart2RefusesWhatIsNotAKey(t *testing.T) {
 		if _, err := lnurlcash.DeriveNoteSecretKey(key, chainCode, 0); err == nil {
 			t.Errorf("derived from branch key %x", key)
 		}
-		if _, err := lnurlcash.SignNoteOwnership(key); err == nil {
+		if _, err := lnurlcash.SignNoteOwnership(key, part2.domain); err == nil {
 			t.Errorf("signed with %x", key)
 		}
 		if _, err := lnurlcash.CashNodeToCx1(lnurlcash.CashNode{PrivateKey: key}); err == nil {
@@ -334,40 +426,42 @@ func TestPart2RefusesWhatIsNotAKey(t *testing.T) {
 	}
 
 	current, _ := lnurlcash.DecodeCk1(part2.a.Ck1)
-	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(current.Current[:95]); err == nil {
-		t.Error("verified a truncated ownership proof")
+	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(current.Current[:95], part2.domain); err == nil {
+		t.Error("verified a truncated ck1")
 	}
 	for _, at := range []int{10, 40, 90} {
 		corrupted := current.Current
 		corrupted[at] ^= 0xff
-		if recovered, err := lnurlcash.RecoverNoteOwnershipPubkey(corrupted[:]); err == nil && hex.EncodeToString(recovered[:]) == part2.a.NotePubkey {
-			t.Errorf("a proof corrupted at byte %d still verifies as the note", at)
+		if owner, err := lnurlcash.RecoverNoteOwnershipPubkey(corrupted[:], part2.domain); err == nil && hex.EncodeToString(owner.PubkeyXOnly[:]) == part2.a.NotePubkey {
+			t.Errorf("a ck1 corrupted at byte %d still verifies as the note", at)
 		}
 	}
 	legacy, _ := lnurlcash.DecodeCk1(legacyCk1(t, part2.a.NoteSecretKey))
 	badRecovery := legacy.Legacy
 	badRecovery[64] = 4
-	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(badRecovery[:]); err == nil {
+	if _, err := lnurlcash.RecoverNoteOwnershipPubkey(badRecovery[:], part2.domain); err == nil {
 		t.Error("recovered with a recovery id of 4")
 	}
 }
 
-func TestTellsTheFourEncodingsApart(t *testing.T) {
+func TestTellsTheFiveEncodingsApart(t *testing.T) {
 	part2 := loadPart2(t)
+	cw1, _ := lnurlcash.BearerCw1(secret(0x11))
 	for _, c := range []struct {
 		value string
-		want  [4]bool
+		want  [5]bool
 	}{
-		{part2.a.Cp1, [4]bool{true, false, false, false}},
-		{part2.a.Ck1, [4]bool{false, true, false, false}},
-		{part2.cs1, [4]bool{false, false, true, false}},
-		{part2.cx1, [4]bool{false, false, false, true}},
-		// a Part 1 secret is never mistaken for any of them
-		{secret(0x11), [4]bool{}},
+		{part2.a.Cp1, [5]bool{true, false, false, false, false}},
+		{part2.a.Ck1, [5]bool{false, true, false, false, false}},
+		{cw1, [5]bool{false, false, true, false, false}},
+		{part2.cs1, [5]bool{false, false, false, true, false}},
+		{part2.cx1, [5]bool{false, false, false, false, true}},
+		// a bearer preimage or h is never mistaken for any of them
+		{secret(0x11), [5]bool{}},
 	} {
-		got := [4]bool{lnurlcash.IsCp1(c.value), lnurlcash.IsCk1(c.value), lnurlcash.IsCs1WithAmount(c.value), lnurlcash.IsCx1(c.value)}
+		got := [5]bool{lnurlcash.IsCp1(c.value), lnurlcash.IsCk1(c.value), lnurlcash.IsCw1(c.value), lnurlcash.IsCs1WithAmount(c.value), lnurlcash.IsCx1(c.value)}
 		if got != c.want {
-			t.Errorf("%.12s...: cp1/ck1/cs1/cx1 = %v, want %v", c.value, got, c.want)
+			t.Errorf("%.12s...: cp1/ck1/cw1/cs1/cx1 = %v, want %v", c.value, got, c.want)
 		}
 	}
 }
@@ -402,6 +496,7 @@ func TestRefusesNonZeroPadding(t *testing.T) {
 		{"cp", part2.a.Cp1, func(v string) error { _, err := lnurlcash.DecodeCp1(v); return err }},
 		{"ck", part2.a.Ck1, func(v string) error { _, err := lnurlcash.DecodeCk1(v); return err }},
 		{"cx", part2.cx1, func(v string) error { _, err := lnurlcash.DecodeCx1(v); return err }},
+		{"cw", mustBearerCw1(t), func(v string) error { _, err := lnurlcash.DecodeCw1(v); return err }},
 	} {
 		_, words, err := bech32.DecodeNoLimit(c.value)
 		if err != nil {
@@ -416,6 +511,15 @@ func TestRefusesNonZeroPadding(t *testing.T) {
 			t.Errorf("%s1 with a padding bit set was accepted", c.hrp)
 		}
 	}
+}
+
+func mustBearerCw1(t *testing.T) string {
+	t.Helper()
+	cw1, err := lnurlcash.BearerCw1(secret(0x11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cw1
 }
 
 func TestTheMasterStepIsTheRootsFirst(t *testing.T) {
@@ -516,7 +620,7 @@ func TestTheClientTakesPart2NotesEndToEnd(t *testing.T) {
 		if q := requests[0].Query(); q.Get("k1") != part2.a.Ck1 || q.Get("p1") != part2.b.Cp1 {
 			t.Errorf("rotate sent %v", q)
 		}
-		if q := requests[1].Query(); q.Get("p1") != part2.b.Cp1 || q.Get("h2") != hash || q.Get("amount") != "5000" {
+		if q := requests[1].Query(); q.Get("p1") != part2.b.Cp1 || q.Get("p2") != hash || q.Get("amount") != "5000" {
 			t.Errorf("split sent %v", q)
 		}
 		if q := requests[2].Query(); len(q["k1"]) != 2 || q.Get("p1") != part2.c.Cp1 {
@@ -541,13 +645,13 @@ func TestTheClientTakesPart2NotesEndToEnd(t *testing.T) {
 	})
 }
 
-// ---- what a cp1 output is owed ----
+// ---- what an output named by cp1 is owed ----
 
-// LUD-25 Part 2 certifies cp1 notes, and only them. A mint that mints to a key
-// and answers without a cs1 has issued a note nobody can check offline, which
-// is the one thing a cp1 note is for, so no Policy waives it. The mutation
-// landed all the same: the error is about verifiability, and the note exists
-// at the caller's key.
+// LUD-25 has a mint certify every note (a SHOULD). This package insists for an
+// output the caller named by cp1: a mint that mints there and answers without
+// a cs1 has issued a note nobody can check offline, which is the reason to
+// name it so, and no Policy waives it. The mutation landed all the same: the
+// error is about verifiability, and the note exists at the caller's key.
 func TestAnUncertifiedCp1OutputIsUnverifiableWhateverThePolicy(t *testing.T) {
 	part2 := loadPart2(t)
 	hash, _ := lnurlcash.HashK1(secret(0x11))
@@ -583,7 +687,7 @@ func TestAnUncertifiedCp1OutputIsUnverifiableWhateverThePolicy(t *testing.T) {
 		}
 	}
 
-	// The tolerant policy preserves a legacy hash output from no-signer mode.
+	// The tolerant policy admits an uncertified output named by a bearer h.
 	if _, err := lnurlcash.NewClient().RotateNoteWithHash(ctx(t), callback, part2.a.Ck1, hash); err != nil {
 		t.Errorf("an unsigned plain output was refused: %v", err)
 	}
@@ -680,10 +784,16 @@ func FuzzPart2Decoders(f *testing.F) {
 		if branch, err := lnurlcash.DecodeCx1(value); err == nil && lnurlcash.EncodeCx1(branch.PubkeyXOnly, branch.ChainCode) != canonical {
 			t.Errorf("cx1 %q decodes to %+v, which encodes differently", value, branch)
 		}
+		if spend, err := lnurlcash.DecodeCw1(value); err == nil {
+			if encoded, encodeErr := lnurlcash.EncodeCw1(spend); encodeErr != nil || encoded != canonical {
+				t.Errorf("cw1 %q decodes to %+v, which encodes differently (%v)", value, spend, encodeErr)
+			}
+		}
 		// and everything that reads a k1 or a signature through them
 		_, _ = lnurlcash.NoteIDOf(value)
 		_, _ = lnurlcash.NoteLookupOf(value)
-		_ = lnurlcash.VerifyNoteSignature(value, 1, value, value)
+		_, _ = lnurlcash.VerifySpend(value, "mint.example")
+		_ = lnurlcash.VerifyNoteSignature(value, value, 1, value, value)
 		_ = lnurlcash.BuildNoteInfoURLByHash("https://mint.example/w", value)
 	})
 }

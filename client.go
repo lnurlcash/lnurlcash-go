@@ -32,8 +32,9 @@ type Client struct {
 	Secrets SecretSource
 
 	// Policy is what this client insists a service does. The zero value is
-	// the default: a cp1 output must come back certified and a withdrawRequest
-	// must publish mintPubkey, while a plain note need not be signed.
+	// the default: an output named by cp1 must come back certified and a
+	// withdrawRequest must publish mintPubkey, while an output named by a
+	// bearer note's hex h need not be.
 	Policy Policy
 
 	// MutationRetries is how many times to re-send a rotate, split or merge
@@ -201,10 +202,10 @@ func (c *Client) FetchNoteInfo(ctx context.Context, noteURL string) (WithdrawInf
 	return ParseNoteInfo(body, noteURL, c.Policy)
 }
 
-// FetchNoteInfoByHash performs the informational GET by hash rather than by
-// secret, so the service learns which note is being asked about but never what
-// spends it. h is a hash, or a Part 2 note's cp1; NoteLookupOf gives the right
-// one for either kind of k1.
+// FetchNoteInfoByHash performs the informational GET by the note's public
+// name rather than a spend of it, so the service learns which note is being
+// asked about but never what spends it. h is a cp1, or a bearer note's hex h;
+// NoteLookupOf gives the right one for any k1.
 //
 // The form to use for any lookup not immediately followed by a mutation -
 // checking a balance, and above all walking a derivation during a restore.
@@ -242,10 +243,10 @@ func (c *Client) FetchMintAddress(ctx context.Context, rawURL string) (MintAddre
 // the success it returned the first time, rather than with the already-spent
 // refusal its burned inputs would otherwise earn.
 //
-// The same Request goes out each time rather than a rebuilt one, because the
-// replay is matched on the k1 set, h, h2 and amount. Regenerating a secret
-// between attempts would make the retry a DIFFERENT mutation, and against a
-// service that had already applied the first, a second real burn.
+// The same Request goes out each time rather than a rebuilt one. The replay is
+// matched on the notes the k1s open, p1, p2 and amount, so regenerating a
+// secret between attempts would make the retry a DIFFERENT mutation, and
+// against a service that had already applied the first, a second real burn.
 //
 // Only ambiguity is retried. A definitive refusal is the service's considered
 // answer and asking again cannot improve it. A melt is never retried at all.
@@ -283,19 +284,19 @@ func (c *Client) MeltNote(ctx context.Context, callback, k1, pr string) (Mutatio
 	return c.mutate(ctx, request, err, MutationMelt)
 }
 
-// RotatedNote is a note this wallet now holds, whose secret the service has
-// never seen.
+// RotatedNote is a bearer note this wallet now holds, whose preimage the
+// service has never seen.
 //
-// Signature is empty when a mint has no signer. The reference mint otherwise
-// returns its raw Part 1 signature for this legacy hash output. To hold an
-// amount-bearing certificate, rotate into a cp1 key with RotateNoteWithHash.
+// Signature is the service's cs1 over the note's hex(Q) and value, or empty
+// from a mint with no signer (see Policy.RequireSignatures). Check it with
+// VerifyNoteSignature.
 type RotatedNote struct {
 	K1        string
 	Signature string
 }
 
-// SplitNotes are the two notes a split produced. Both are plain notes, so each
-// signature is present or empty on the same terms as RotatedNote's.
+// SplitNotes are the two notes a split produced. Both are bearer notes, so
+// each signature is present or empty on the same terms as RotatedNote's.
 type SplitNotes struct {
 	K1              string
 	Change          string
@@ -358,19 +359,19 @@ func (c *Client) MergeNotes(ctx context.Context, callback string, k1s []string) 
 	return RotatedNote{K1: fresh, Signature: mutation.Signature}, nil
 }
 
-// The hash-parameterised mutations: the caller supplies each output rather than
+// The caller-named mutations: the caller supplies each output rather than
 // having this client draw a secret for it. What a hardware wallet drives, where
-// the secret never enters this process - and the only way to mint to a Part 2
-// key, which the caller derives (DeriveNotePubkey) and passes as a cp1.
+// the secret never enters this process - and the way to mint to a key, which
+// the caller derives (DeriveNotePubkey) and passes as a cp1.
 //
-// A k1 may be a Part 1 secret or a Part 2 ck1, and outputs may be hashes or
-// cp1s, mixed freely. Retried exactly as RotateNote is. There are no NewSecrets
-// on any error: the caller already holds whatever the outputs belong to, and
-// must have persisted it - with the index it came from - before calling.
+// A k1 may be any spend, and outputs may be bearer hashes or cp1s, mixed
+// freely. Retried exactly as RotateNote is. There are no NewSecrets on any
+// error: the caller already holds whatever the outputs belong to, and must
+// have persisted it - with the index it came from - before calling.
 //
-// A cp1 output that comes back without its cs1 is an UnverifiableError,
-// whatever the Policy says: the note exists at the caller's key, but nobody
-// can check it offline, which is the reason to hold a cp1 note at all.
+// An output named by cp1 that comes back without its cs1 is an
+// UnverifiableError, whatever the Policy says: the note exists at the caller's
+// key, but nobody can check it offline, which is the reason to name it so.
 
 // RotateNoteWithHash burns k1 and mints a note of the same value to h.
 func (c *Client) RotateNoteWithHash(ctx context.Context, callback, k1, h string) (Mutation, error) {
@@ -417,12 +418,12 @@ func (c *Client) RequestInvoice(ctx context.Context, payCallback string, amountM
 	return ParseInvoice(body, amountMsat)
 }
 
-// RequestMintInvoice asks for an invoice that mints a note the caller already
-// holds the secret to.
+// RequestMintInvoice asks for an invoice that mints a bearer note the caller
+// already holds the preimage to.
 //
 // Persist mintSecret before paying the invoice this returns. The service only
 // ever learns its hash, so it cannot help reconstruct it, and a paid invoice
-// whose secret was lost is a note nobody can spend.
+// whose preimage was lost is a note nobody can spend.
 func (c *Client) RequestMintInvoice(ctx context.Context, payCallback string, amountMsat int64, mintSecret string) (Invoice, error) {
 	request, err := MintInvoiceRequest(payCallback, amountMsat, mintSecret)
 	if err != nil {
@@ -436,8 +437,8 @@ func (c *Client) RequestMintInvoice(ctx context.Context, payCallback string, amo
 }
 
 // RequestMintInvoiceWithHash asks for an invoice that mints to an output the
-// caller names: a hash, or a Part 2 cp1, which goes as the comment alone. See
-// MintInvoiceRequestWithHash.
+// caller names: a bearer note's hex h, or a cp1, which goes as the comment
+// alone. See MintInvoiceRequestWithHash.
 func (c *Client) RequestMintInvoiceWithHash(ctx context.Context, payCallback string, amountMsat int64, h string) (Invoice, error) {
 	request, err := MintInvoiceRequestWithHash(payCallback, amountMsat, h)
 	if err != nil {

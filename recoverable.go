@@ -1,19 +1,20 @@
 package lnurlcash
 
-// LUD-25 Part 2: notes keyed by a public key.
+// LUD-25's wire values, and notes owned by a key.
 //
-// A Part 2 note is keyed by a public key rather than a hash. The holder keeps
-// sk, discloses pk as cp1<pk>, and spends the note with ck1: pk followed by a
-// BIP-340 signature by sk over one fixed digest. The service verifies the pair
-// and looks the note up by pk. The service certifies each note with cs1, the
-// same signature it has always made, over hex(pk) instead of a hash, so a
-// recipient can check issuance offline with nothing but the ck1 and the cs1.
+// Every note is a taproot output key Q, written cp1<Q> (spend.go). A key-path
+// note is the case where Q is the holder's own key, used as is: the holder
+// keeps sk, discloses cp1<Q>, and spends the note with a ck1, Q followed by a
+// BIP-340 signature by sk over the key-path sighash for the mint's domain. The
+// mint certifies every note with a cs1 over hex(Q), so a recipient can check
+// issuance offline with nothing but the spend, the cs1 and the note URL's
+// domain.
 //
 // A watch-only cx1 - a branch's x-only key and its chain code - lets whoever
 // holds it derive every note key on the branch, which is how a service mints
 // straight to a holder's next key, but spend none of them.
 //
-// The names follow lnurlcash-kit's recoverable.ts, which follows lnurl-wallet.
+// The names follow lnurl-wallet's src/lib.
 
 import (
 	"crypto/hmac"
@@ -78,10 +79,12 @@ func decodeFixed(hrp, value string, length int) ([]byte, error) {
 	return payload, nil
 }
 
-// EncodeCp1 encodes a note's public key: 32 bytes, x-only, as BIP-340.
+// EncodeCp1 encodes a note's output key Q: 32 bytes, x-only, as BIP-340.
 func EncodeCp1(pubkeyXOnly [32]byte) string { return encodeFixed("cp", pubkeyXOnly[:]) }
 
-// DecodeCp1 reads a cp1 back to its x-only key.
+// DecodeCp1 reads a cp1 back to its x-only key. A Q that is not the x
+// coordinate of a curve point is refused, as LUD-25 has a mint refuse it: no
+// spend could ever open that note, so paying into it would burn the money.
 func DecodeCp1(value string) ([32]byte, error) {
 	var out [32]byte
 	payload, err := decodeFixed("cp", value, len(out))
@@ -89,18 +92,21 @@ func DecodeCp1(value string) ([32]byte, error) {
 		return out, err
 	}
 	copy(out[:], payload)
+	if !IsXOnlyPoint(out) {
+		return [32]byte{}, &ProtocolError{Detail: "not a cp1: its key is not the x coordinate of a point on the curve"}
+	}
 	return out, nil
 }
 
-// IsCp1 reports whether value is a well-formed cp1.
+// IsCp1 reports whether value is a well-formed cp1 naming a curve point.
 func IsCp1(value string) bool {
 	_, err := DecodeCp1(value)
 	return err == nil
 }
 
-// EncodeCk1 encodes a note's bearer secret: its 32-byte x-only public key
-// followed by its 64-byte BIP-340 signature, from SignNoteOwnership. Whoever
-// has it can spend the note.
+// EncodeCk1 encodes a key-path spend: the note's 32-byte output key Q followed
+// by its 64-byte BIP-340 signature, from SignNoteOwnership. Whoever has it can
+// spend the note, at the one mint it was signed for.
 func EncodeCk1(payload [96]byte) string { return encodeFixed("ck", payload[:]) }
 
 // DecodedCk1 is what a ck1 carries. A current ck1 fills Current. A legacy one,
@@ -140,7 +146,7 @@ func DecodeCk1(value string) (DecodedCk1, error) {
 }
 
 // IsCk1 reports whether value is a well-formed ck1, either form. Well-formed
-// only: whether its proof verifies is NoteIDOf's question.
+// only: whether it opens its note at a mint is VerifySpend's question.
 func IsCk1(value string) bool {
 	_, err := DecodeCk1(value)
 	return err == nil
@@ -348,10 +354,10 @@ func IsCx1(value string) bool {
 // The four-byte big-endian width is what lnurl-wallet and lnurl-mint both use;
 // the spec text does not pin it.
 //
-// t >= n is refused rather than reduced, as BIP-341 does and lnurl-mint does,
-// and so is a note key at zero. Both are ~2^-128 events, but a key that
-// differs from the one every other implementation derives is a note nobody can
-// find, so the index is reported unusable and the caller moves to the next.
+// t is reduced mod n, as the spec requires and lnurl-wallet does (lnurl-mint
+// refuses t >= n instead; at ~2^-128 the two never meet). What is refused is a
+// note key at infinity or zero: the index is reported unusable and the caller
+// moves to the next.
 
 var noteDeriveTag = sha256.Sum256([]byte("LNURLcash/derive"))
 
@@ -368,10 +374,9 @@ func noteTweak(pubkeyXOnly, chainCode [32]byte, index uint32) (secp256k1.ModNSca
 	}
 	var digest [32]byte
 	h.Sum(digest[:0])
+	// SetBytes reduces mod n; its overflow flag only reports that it did
 	var t secp256k1.ModNScalar
-	if t.SetBytes(&digest) != 0 {
-		return t, unusableIndex(index)
-	}
+	t.SetBytes(&digest)
 	return t, nil
 }
 
@@ -429,17 +434,20 @@ func DeriveNoteSecretKey(branchPrivateKey, chainCode [32]byte, index uint32) ([3
 	return p.Bytes(), nil
 }
 
-// ---- ownership proofs ----
+// ---- key-path spends ----
 //
-//	sig = BIP340.Sign(sk, sha256("LNURLcash"))
-//	ck1 = bech32m("ck", pk || sig)
+//	sig = BIP340.Sign(sk, KeyPathSighash(Q, domain), aux_rand = 0^32)
+//	ck1 = bech32m("ck", Q || sig)
 //
-// One fixed digest and fixed all-zero BIP-340 auxiliary input make the bearer
-// value deterministic: re-deriving a key reproduces its one ck1 byte for byte.
-// The message is hashed to 32 bytes before signing, rather than signed as the
-// raw 9-byte string, because BIP-340's own reference implementation and most
-// conforming Schnorr signers (libsecp256k1's schnorrsig module and btcec's
-// included) only accept a 32-byte message (2026-09-16, luds#6de59b2).
+// The sighash depends on nothing but the note and the mint, and the auxiliary
+// input is fixed, so a key has exactly one ck1 per mint: re-deriving the key
+// reproduces it byte for byte, which is what lets seed recovery find a note
+// already held. A ck1 for one mint fails at every other.
+//
+// Two older ck1s are still read, never made, so notes already handed out stay
+// spendable long enough to rotate: the same Q || sig shape signed over the
+// fixed message sha256("LNURLcash") (and, before 2026-09-16, the raw 9-byte
+// string), and the pre-Schnorr 65-byte recoverable ECDSA signature.
 
 var noteOwnershipMessage = []byte("LNURLcash")
 
@@ -451,78 +459,104 @@ var legacyNoteOwnershipDigest = func() [32]byte {
 	return sha256.Sum256(inner[:])
 }()
 
-// NoteOwnershipMessage returns the message every ownership signature is made
-// over. Since 2026-09-16 it is signed as its sha256 digest; before that, as
-// the raw bytes, which RecoverNoteOwnershipPubkey still reads back.
-func NoteOwnershipMessage() []byte {
-	return append([]byte(nil), noteOwnershipMessage...)
-}
-
 // decred lays a compact signature out as header || r || s, the header being 27,
 // plus 4 for a compressed key, plus the recovery id. The wire puts the bare
 // recovery id last instead, so every signature crossing that boundary is
 // rebuilt.
 const compactHeaderCompressed = 27 + 4
 
-// SignNoteOwnership signs the ownership digest with a note's secret key and
-// returns the 96-byte pk || sig payload. Encode it with EncodeCk1 to spend the
-// note - which makes the result bearer material, exactly as the secret key is.
-func SignNoteOwnership(secretKey [32]byte) ([96]byte, error) {
+// SignNoteOwnership signs a key-path note's spend at one mint and returns the
+// 96-byte Q || sig payload. Encode it with EncodeCk1 to spend the note - which
+// makes the result bearer material, exactly as the secret key is. domain is
+// the mint's, in any form SpendDomainOf reads.
+func SignNoteOwnership(secretKey [32]byte, domain string) ([96]byte, error) {
 	var out [96]byte
 	var key btcec.ModNScalar
 	if key.SetBytes(&secretKey) != 0 || key.IsZero() {
 		return out, &ProtocolError{Detail: "a note secret key is a 32-byte scalar in [1, n)"}
 	}
 	private := btcec.PrivKeyFromScalar(&key)
-	signature, err := schnorr.Sign(private, noteOwnershipDigest[:], schnorr.CustomNonce([32]byte{}))
+	var q [32]byte
+	copy(q[:], schnorr.SerializePubKey(private.PubKey()))
+	sighash, err := KeyPathSighash(q, domain)
 	if err != nil {
-		return out, &ProtocolError{Detail: "could not sign the note ownership message"}
+		return out, err
 	}
-	copy(out[:32], schnorr.SerializePubKey(private.PubKey()))
+	signature, err := schnorr.Sign(private, sighash[:], schnorr.CustomNonce([32]byte{}))
+	if err != nil {
+		return out, &ProtocolError{Detail: "could not sign the key-path spend"}
+	}
+	copy(out[:32], q[:])
 	copy(out[32:], signature.Serialize())
 	return out, nil
 }
 
-// RecoverNoteOwnershipPubkey validates an ownership payload and returns the
-// note's x-only public key. A 96-byte pk || sig is verified against the current
-// sha256 digest first, then against the pre-2026-09-16 raw message, so a note
-// minted under that scheme stays redeemable until it is rotated;
-// SignNoteOwnership never produces that shape anymore. A legacy 65-byte
-// r || s || recovery id signature is recovered as before. An error for an
-// invalid proof or any other length.
-func RecoverNoteOwnershipPubkey(payload []byte) ([32]byte, error) {
-	var out [32]byte
+// NoteOwnership is the note a verified ck1 opens.
+type NoteOwnership struct {
+	PubkeyXOnly [32]byte
+	// Legacy is a ck1 signed over a fixed message rather than the spend
+	// sighash, or the pre-Schnorr recoverable shape. Rotate it.
+	Legacy bool
+}
+
+// RecoverNoteOwnershipPubkey verifies a ck1's payload and returns the note it
+// opens. A 96-byte Q || sig is verified against the key-path sighash for
+// domain first; failing that, against the fixed messages older ck1s signed,
+// which reports Legacy. A 65-byte recoverable signature is recovered, and is
+// always Legacy. An error for a proof that does not verify, or any other
+// length.
+func RecoverNoteOwnershipPubkey(payload []byte, domain string) (NoteOwnership, error) {
 	switch len(payload) {
 	case 96:
+		invalid := &ProtocolError{Detail: "that key-path spend does not verify"}
 		pubkey, err := schnorr.ParsePubKey(payload[:32])
 		if err != nil {
-			return out, &ProtocolError{Detail: "that ownership proof does not verify"}
+			return NoteOwnership{}, invalid
 		}
 		signature, err := schnorr.ParseSignature(payload[32:])
 		if err != nil {
-			return out, &ProtocolError{Detail: "that ownership proof does not verify"}
+			return NoteOwnership{}, invalid
 		}
-		if !signature.Verify(noteOwnershipDigest[:], pubkey) && !verifyBIP340(payload[:32], payload[32:], noteOwnershipMessage) {
-			return out, &ProtocolError{Detail: "that ownership proof does not verify"}
+		var owner NoteOwnership
+		copy(owner.PubkeyXOnly[:], payload[:32])
+		// A missing or unreadable domain only rules out the current form: the
+		// fixed-message ones never had one.
+		if sighash, err := KeyPathSighash(owner.PubkeyXOnly, domain); err == nil && signature.Verify(sighash[:], pubkey) {
+			return owner, nil
 		}
-		copy(out[:], payload[:32])
-		return out, nil
+		if signature.Verify(noteOwnershipDigest[:], pubkey) || verifyBIP340(payload[:32], payload[32:], noteOwnershipMessage) {
+			owner.Legacy = true
+			return owner, nil
+		}
+		return NoteOwnership{}, invalid
 	case 65:
-		if payload[64] > 3 {
-			return out, &ProtocolError{Detail: "a recoverable signature ends in a recovery id of 0 to 3"}
-		}
-		var compact [65]byte
-		compact[0] = compactHeaderCompressed + payload[64]
-		copy(compact[1:], payload[:64])
-		pubkey, _, err := ecdsa.RecoverCompact(compact[:], legacyNoteOwnershipDigest[:])
+		key, err := recoverLegacyCk1(payload)
 		if err != nil {
-			return out, &ProtocolError{Detail: "that ownership signature does not recover to a key"}
+			return NoteOwnership{}, err
 		}
-		copy(out[:], pubkey.SerializeCompressed()[1:])
-		return out, nil
+		return NoteOwnership{PubkeyXOnly: key, Legacy: true}, nil
 	default:
-		return out, &ProtocolError{Detail: "an ownership proof is 96 bytes, or a legacy 65"}
+		return NoteOwnership{}, &ProtocolError{Detail: "a ck1 payload is 96 bytes, or a legacy 65"}
 	}
+}
+
+// recoverLegacyCk1 recovers the key behind a pre-Schnorr 65-byte ck1, an
+// r || s || recovery id signature over a fixed message. Recovering a key is
+// that shape's whole check: it names its note by the key it recovers to.
+func recoverLegacyCk1(payload []byte) ([32]byte, error) {
+	var out [32]byte
+	if len(payload) != 65 || payload[64] > 3 {
+		return out, &ProtocolError{Detail: "a recoverable signature ends in a recovery id of 0 to 3"}
+	}
+	var compact [65]byte
+	compact[0] = compactHeaderCompressed + payload[64]
+	copy(compact[1:], payload[:64])
+	pubkey, _, err := ecdsa.RecoverCompact(compact[:], legacyNoteOwnershipDigest[:])
+	if err != nil {
+		return out, &ProtocolError{Detail: "that ownership signature does not recover to a key"}
+	}
+	copy(out[:], pubkey.SerializeCompressed()[1:])
+	return out, nil
 }
 
 var bip340ChallengeTag = sha256.Sum256([]byte("BIP0340/challenge"))
@@ -565,58 +599,48 @@ func verifyBIP340(pubkeyXOnly, signature, message []byte) bool {
 	return !R.Y.IsOdd() && r.Equals(&R.X)
 }
 
-// ---- a note's k1, either kind ----
+// ---- a note's k1, any kind ----
 
-// NoteIDOf returns the id a service files a note under: hex sha256(k1) for a
-// Part 1 secret, and for a Part 2 ck1 the verified hex x-only key it embeds.
-// An error for anything else, including a ck1 whose proof does not verify.
+// NoteIDOf returns the id a service files the note k1 opens under: hex(Q). A
+// bearer preimage names the bearer note it opens, a cw1 the Q its control block
+// commits to, a ck1 the Q it carries. An error for anything that is no spend.
 //
-// Compare notes by this, never by an unverified payload.
+// This names the note; it does not check that k1 opens it, which for a ck1
+// needs the mint's domain. That is VerifySpend.
 func NoteIDOf(k1 string) (string, error) {
-	value := strings.ToLower(strings.TrimSpace(k1))
-	if IsPreimage(value) {
-		return HashK1(value)
-	}
-	pubkey, err := ck1Pubkey(value)
+	spend, err := DecodeSpend(strings.ToLower(strings.TrimSpace(k1)))
 	if err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(pubkey[:]), nil
+	return hex.EncodeToString(spend.OutputKey[:]), nil
 }
 
-// NoteLookupOf returns what to look a note up by without disclosing it: the
-// hash for a Part 1 secret, and for a Part 2 note its cp1, which also brings
-// its certificate back. Pass it to BuildNoteInfoURLByHash or
+// NoteLookupOf returns what to look a note up by without disclosing it: a
+// bearer preimage's hex h, which every mint that ever took a hash lookup
+// understands, and the cp1 of anything else. Both are LUD-25's cp1 slot, and
+// both bring the note's certificate back. Pass it to BuildNoteInfoURLByHash or
 // Client.FetchNoteInfoByHash.
 func NoteLookupOf(k1 string) (string, error) {
 	value := strings.ToLower(strings.TrimSpace(k1))
 	if IsPreimage(value) {
 		return HashK1(value)
 	}
-	pubkey, err := ck1Pubkey(value)
+	spend, err := DecodeSpend(value)
 	if err != nil {
 		return "", err
 	}
-	return EncodeCp1(pubkey), nil
-}
-
-func ck1Pubkey(value string) ([32]byte, error) {
-	decoded, err := DecodeCk1(value)
-	if err != nil {
-		return [32]byte{}, &ProtocolError{Detail: "a k1 is 32 bytes of hex or a ck1"}
-	}
-	return RecoverNoteOwnershipPubkey(decoded.Bytes())
+	return EncodeCp1(spend.OutputKey), nil
 }
 
 // ---- the address branch ----
 
 // DeriveCashAddressNode returns m/139'/d1/d2/d3/d4 for one mint - the literal
 // path LUD-25's text specifies, and the exact node DeriveCashDomainNode already
-// derives for any service. There is no separate purpose for Part 2: an earlier
-// reference-wallet extension deterministically derived Part 1 secrets off this
-// same root too, under a 1' sub-purpose kept just for this branch to avoid
-// colliding with it; that extension is gone (see cash.go), so there is nothing
-// left to collide with.
+// derives for any service. There is no separate purpose for key-path notes: an
+// earlier reference-wallet extension deterministically derived bearer
+// preimages off this same root too, under a 1' sub-purpose kept just for this
+// branch to avoid colliding with it; that extension is gone (see cash.go), so
+// there is nothing left to collide with.
 //
 // Bearer material for every note on the branch. Hand out CashNodeToCx1 of it,
 // never the node.

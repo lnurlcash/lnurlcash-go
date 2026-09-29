@@ -1,7 +1,7 @@
 package lnurlcash
 
 // LUD-25's m/139' branch derivation: the BIP-32 walk from a wallet's cash root
-// down to a per-service domain node, exactly as Part 2's "Seed & derivation"
+// down to a per-service domain node, exactly as its "Seed & derivation"
 // section specifies it:
 //
 //	cashHashingKey   = derive(masterKey, m/139'/0)
@@ -21,17 +21,17 @@ package lnurlcash
 // different tree from every conforming wallet - and a restore against it finds
 // nothing, silently, and only once the money is gone.
 //
-// Part 1 secrets are NOT derived from this node, or from the seed at all -
-// Part 1's own text has the wallet generate plain randomness. An earlier
-// reference-wallet extension did derive Part 1 secrets deterministically from
+// Bearer preimages are NOT derived from this node, or from the seed at all -
+// LUD-25 has the wallet generate plain randomness. An earlier
+// reference-wallet extension did derive them deterministically from
 // this node, hardened at the note's own index; it has since been dropped as
 // unspecified, and this package no longer provides it. secrets.go's legacy
 // scheme (HMAC-SHA256 under "lnurlcash-note-v1", predating LUD-25 entirely) is
 // still derived and still scanned on restore, so nothing already minted under
 // it goes missing.
 //
-// Part 2's address branch is this exact domain node, for the same host: see
-// DeriveCashAddressNode.
+// The key-path notes' address branch is this exact domain node, for the same
+// host: see DeriveCashAddressNode.
 
 import (
 	"crypto/hmac"
@@ -172,8 +172,8 @@ func CashDomainIndices(root CashNode, host string) ([4]uint32, error) {
 	return out, nil
 }
 
-// DeriveCashDomainNode returns m/139'/d1/d2/d3/d4 for one mint: Part 2's
-// address branch, which DeriveCashAddressNode returns too.
+// DeriveCashDomainNode returns m/139'/d1/d2/d3/d4 for one mint: the address
+// branch of its key-path notes, which DeriveCashAddressNode returns too.
 //
 // Whoever holds it can derive every note key the wallet will ever hold AT THIS
 // MINT, so it is provisioning material rather than something to hand out: one

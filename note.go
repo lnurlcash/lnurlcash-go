@@ -58,9 +58,11 @@ func NoteSignature(rawURL string) string {
 
 // ResolveNoteInput resolves input to a note URL, or "" if it is not one.
 //
-// Input only qualifies if it carries a well-formed k1: 32 bytes hex, or a Part 2
-// ck1 with a valid key/signature pair. Anything else would fail during hashing later, so
-// it is refused at the door.
+// Input only qualifies if its k1 is a spend that opens its note at the URL's
+// own domain (VerifySpend): a bearer preimage or cw1, or a ck1 signed for this
+// mint. A ck1 signed for another mint could never be redeemed here, so it is
+// refused at the door. A cw1 whose leaf this package cannot run passes on its
+// structure alone; the mint judges the rest.
 func ResolveNoteInput(value string) string {
 	resolved := ResolveLnurlInput(value)
 	if resolved == "" {
@@ -70,7 +72,7 @@ func ResolveNoteInput(value string) string {
 	if k1 == "" {
 		return ""
 	}
-	if _, err := NoteIDOf(k1); err != nil {
+	if _, err := VerifySpend(k1, resolved); err != nil {
 		return ""
 	}
 	return resolved
@@ -98,36 +100,30 @@ func BuildNoteURL(withdrawLink, k1 string, amountMsat int64) string {
 }
 
 // BuildNoteInfoURLByHash builds the informational GET for a note named by its
-// HASH rather than its secret.
+// public name rather than a spend of it.
 //
-// LUD-25's "Checking a note without exposing it": a service MAY accept
-// ?h=<hex sha256 of k1> in place of ?k1=, on the informational GET only and
-// never at the callback. It already stores every note under that hash, so this
-// is a second way into a lookup it can do anyway - and the secret stays off
+// LUD-25's "Checking a note without exposing it": a service MUST accept
+// ?p=<cp1> in place of ?k1=, or a bearer note's hex h as its short form, on
+// the informational GET only and never at the callback. The spend stays off
 // the wire, which is what a restore walk needs, since a walk queries a whole
 // gap window of indices the wallet has not minted into yet.
 //
 // k1, amount and sig are dropped: naming the note twice, once in a form that
 // spends it, would defeat the point.
 //
-// A service that does not index by hash answers exactly as it answers for an
-// unknown k1, which LUD-25 requires, so a rejection never distinguishes "not
-// supported" from "no such note" - and a burned note is deliberately
-// indistinguishable from one that never existed.
+// An unknown note is answered exactly as an unknown k1 is, and a burned note
+// is deliberately indistinguishable from one that never existed.
 //
-// h may also be a Part 2 cp1, sent as p, the name LUD-25 now uses. A hash keeps
-// the older h, which every mint that ever took a hash lookup understands. Same
-// rule as lnurl-wallet. NoteLookupOf gives the right one for either kind of k1.
+// h is a cp1 or a bearer note's hex h, and goes as p either way. Mints from
+// before LUD-25 settled on p also read h, but every current one reads p for
+// both. NoteLookupOf gives the right value for any k1.
 //
 // Returns "" if h is neither 32 bytes of hex nor a cp1, or the link does not
 // parse.
 func BuildNoteInfoURLByHash(withdrawLink, h string) string {
 	value := strings.ToLower(strings.TrimSpace(h))
-	key := "h"
-	switch {
-	case IsCp1(value):
-		key = "p"
-	case !IsPreimage(value):
+	key := "p"
+	if !IsCp1(value) && !IsPreimage(value) {
 		return ""
 	}
 	parsed, err := url.Parse(FromLud17(strings.TrimSpace(withdrawLink)))

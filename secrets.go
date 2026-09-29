@@ -8,9 +8,10 @@ import (
 	"fmt"
 )
 
-// HashK1 returns a note's id: the h (or h2) a wallet discloses on a rotate,
-// split or merge, and the key a service stores the note under. Never the
-// secret itself.
+// HashK1 returns a bearer preimage's h = sha256(k1): the short form a wallet
+// discloses as p1, p2 or a mint comment to name the bearer note. The note
+// itself is filed under hex(Q), which follows from h (BearerNoteID); h never
+// reveals the preimage.
 func HashK1(k1 string) (string, error) {
 	raw, err := hex.DecodeString(k1)
 	if err != nil {
@@ -20,10 +21,10 @@ func HashK1(k1 string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// GenerateNoteSecret draws a fresh 32-byte note secret from the OS CSPRNG.
+// GenerateNoteSecret draws a fresh 32-byte bearer preimage from the OS CSPRNG.
 //
-// Per LUD-25 the wallet - never the service - generates the replacement note's
-// secret and discloses only its hash. The same size a Lightning payment
+// Per LUD-25 the wallet - never the service - generates every note it will
+// hold and discloses only its public name. The same size a Lightning payment
 // preimage is, though nothing is ever paid for it.
 func GenerateNoteSecret() (string, error) {
 	buf := make([]byte, 32)

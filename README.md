@@ -46,8 +46,9 @@ rotated, err := client.RotateNote(ctx, callback, oldK1)
 negative turns it off). Only rotate, split and merge — never a melt, which
 carries `pr`, is paid asynchronously and has no replay guarantee — and only an
 ambiguous failure, never a refusal the service actually considered. The
-re-sent request is byte-identical, because the replay is matched on the k1 set,
-`h`, `h2` and `amount`.
+re-sent request is byte-identical: the replay is matched on the notes the
+`k1`s open, `p1`, `p2` and `amount`, and a fresh secret would make it a
+different mutation.
 
 `NewClient` still sets `DisableKeepAlives`. A deliberate retry this package
 counts is a different thing from an invisible one it does not, a service that
@@ -55,30 +56,31 @@ has not caught up still answers the second attempt as already spent, and a
 fresh connection per request is not a cost worth weighing against leaving that
 to chance. **If you supply your own `*http.Client`, do the same.**
 
-## Legacy signatures and cp1 certificates
+## Certificates
 
-The reference mint returns a raw Part 1 signature for a legacy hash output
-when a signer is available, and may omit it in no-signer mode. This package
-accepts that omission by default and passes through any signature received.
+LUD-25 has a mint certify every note it issues with a `cs1` over the note's
+`hex(Q)` and value, a bearer note included. It is a SHOULD, and a mint with no
+signer omits it, so a mutation to an output named by a bearer note's hex `h`
+may come back uncertified: this package accepts that by default and passes
+through any certificate it receives.
 
-A `cp1` output is owed its `cs1` certificate, always, and no `Policy` waives
-it. A mutation to one that the service confirms without it returns
-`*UnverifiableError`, which **carries the fresh secrets**, because the mutation
-landed and the note it minted is real. Read them with `NewSecrets` and persist
-them before anything else. The `*WithHash` calls have none to carry: you named
-the output, so you already hold what spends it.
+An output named by a `cp1` is owed its `cs1`, always, and no `Policy` waives
+it: offline verification is the reason to name a note that way. A mutation to
+one that the service confirms without it returns `*UnverifiableError`, which
+**carries the fresh secrets**, because the mutation landed and the note it
+minted is real. Read them with `NewSecrets` and persist them before anything
+else. The `*WithHash` calls have none to carry: you named the output, so you
+already hold what spends it.
 
 `ParseNoteInfo` still refuses a `withdrawRequest` publishing no valid
 `mintPubkey`, because that key is what a `cs1` verifies against.
 
 The zero `Policy` is the default. Two fields move it:
 
-- `RequireSignatures: true` demands the raw Part 1 signature over a hash
-  output, matching the committed reference wallet.
-- `AllowMissingMintPubkey: true` admits a Part 1-only mint that publishes no
-  `mintPubkey`. Nothing it issues can then be verified offline.
-
-To hold a note a recipient can check offline, rotate it into a `cp1` key.
+- `RequireSignatures: true` demands a certificate for an output named by a
+  bearer `h` too.
+- `AllowMissingMintPubkey: true` admits a mint that publishes no `mintPubkey`.
+  Nothing it issues can then be verified offline.
 
 ## Usage
 
@@ -137,9 +139,9 @@ retry warning above is yours to honour.
 ## The other three things that will cost you money
 
 **Never let the service generate a replacement secret.** On rotate, split and
-merge this package draws a fresh 32 bytes and discloses only `sha256(secret)`
-as `h`. A service-issued replacement has, structurally, been seen by that
-service.
+merge this package draws a fresh 32-byte preimage and discloses only its
+`h = sha256(preimage)`, as `p1` (and `p2`). A service-issued replacement has,
+structurally, been seen by that service.
 
 **A melt's success means "in flight", not "spent".** The service pays
 asynchronously and only burns the note once the payment settles, restoring it
@@ -157,6 +159,7 @@ the unpaid invoice can poll for it. First rotater wins.
 | `errors.Is(err, ErrRequestRefused)` | nothing was sent. The note is untouched. |
 | `errors.Is(err, ErrNotePending)` | a melt is in flight on this `k1`. Retry. |
 | `IsSpent(err)` | authoritative: already burned. |
+| `errors.Is(err, ErrOutputInUse)` | `already in use`: an output you named is taken. Nothing burned; name a fresh one. |
 | `IsUnknownNote(err)` | the service does not recognise it. |
 | `IsAmbiguous(err)` | outcome **unknown**. `NewSecrets(err)` carries the secrets. |
 | `IsUnverifiable(err)` | the mutation **landed**, but a `cp1` output came back without its `cs1`. `NewSecrets(err)` carries the secrets. |
@@ -195,11 +198,12 @@ root, err := lnurlcash.DeriveCashRoot(seed)               // m/139'
 node, err := lnurlcash.DeriveCashDomainNode(root, host)   // m/139'/d1/d2/d3/d4
 ```
 
-That domain node is Part 2's address branch, below. Part 1 secrets are not
-derived from the seed at all: LUD-25 has the wallet draw them as plain
-randomness, which is what `GenerateNoteSecret` does. An earlier deterministic
-Part 1 ladder beneath this node (`DeriveCashSecret`, `CashSecretAt`,
-`CashSecretSource`) was never part of the spec and is gone.
+That domain node is the address branch of key-path notes, below. Bearer
+preimages are not derived from the seed at all: LUD-25 has the wallet draw
+them as plain randomness, which is what `GenerateNoteSecret` does, and a
+bearer note must be backed up by other means or rotated into a key. An earlier
+deterministic ladder of preimages beneath this node (`DeriveCashSecret`,
+`CashSecretAt`, `CashSecretSource`) was never part of the spec and is gone.
 
 `DeriveNoteRoot` / `DeriveNoteSecret` are the pre-spec HMAC scheme this
 project shipped before the draft had one. Not deprecated, because notes minted
@@ -207,17 +211,30 @@ under it are still money; just not what to mint under. `BuildNoteInfoURLByHash`
 is the private lookup a restore walk over them should use; asking by secret
 publishes the very secrets it is looking for.
 
-## Notes keyed by a public key (LUD-25 Part 2)
+## Notes, spends and certificates
 
-A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`; the mint
-only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`:
-the 32-byte `pk` followed by a BIP-340 Schnorr signature by `sk` over
-`sha256("LNURLcash")`. The mint verifies the pair and uses `pk` to find the
-note. The mint's certificate, `cs1…`, carries the note amount
-in its prefix using BOLT 11 amount rules and contains the signature over
-`LNURLcash:<amount_msat>:<hex(pk)>`, so a recipient can recover the claimed
-amount and check the note offline. A `cp1` note is the only kind the spec
-certifies.
+Every LUD-25 note is a BIP-341 taproot output key `Q`, written `cp1…`, and a
+mint files it under `hex(Q)`. A `k1` is a spend that opens one:
+
+- **A bearer note's preimage**, 64 hex. The note is the one-leaf hashlock
+  `OP_SHA256 <h> OP_EQUAL` under BIP-341's NUMS key, so the preimage is the
+  short form of its script-path spend, and `h = sha256(preimage)` is the short
+  form of its `cp1`. It signs nothing, so it spends its note at any mint.
+- **A `ck1`**: `Q` and a BIP-340 signature by `Q` over the key-path sighash of
+  a fixed, never-broadcast transaction whose prevout is bound to the mint's
+  domain. It spends its note at that mint and nowhere else.
+- **A `cw1`**: a leaf, its control block and the witness the leaf consumes,
+  for any script tree. `Q` is recomputed from the control block.
+
+```go
+spend, _ := lnurlcash.VerifySpend(k1, noteURL)   // opens which Q, at this mint?
+id, _ := lnurlcash.NoteIDOf(k1)                  // hex(Q): compare notes by this, never by k1
+lookup, _ := lnurlcash.NoteLookupOf(k1)          // h or cp1, for FetchNoteInfoByHash
+```
+
+A key-path note's key comes from the seed, and its `ck1` needs the mint's
+domain, which every call takes as a URL or a bare host and reduces to the
+lowercase hostname (`SpendDomainOf`):
 
 ```go
 root, _ := lnurlcash.DeriveCashRoot(seed)
@@ -225,39 +242,62 @@ node, _ := lnurlcash.DeriveCashAddressNode(root, "mint.example") // m/139'/d1/d2
 cx, _ := lnurlcash.CashNodeToCx1(node)
 cx1 := lnurlcash.EncodeCx1(cx.PubkeyXOnly, cx.ChainCode)          // watch-only
 
-pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, i) // what a watcher derives
+pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, i) // Q, used as is
 sk, _ := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, i)
-proof, _ := lnurlcash.SignNoteOwnership(sk)                         // pk || sig, 96 bytes
-ck1 := lnurlcash.EncodeCk1(proof)                                   // the bearer secret
-
-lnurlcash.VerifyNoteSignature(ck1, amountMsat, cs1, mintPubkey)     // offline
-certificate, _ := lnurlcash.DecodeCs1WithAmount(cs1)                // amount + signature
+payload, _ := lnurlcash.SignNoteOwnership(sk, "mint.example")        // Q || sig, 96 bytes
+ck1 := lnurlcash.EncodeCk1(payload)                                   // spends at mint.example only
 ```
 
-`EncodeCs1WithAmount`, `DecodeCs1WithAmount` and `IsCs1WithAmount`
-are the current wire API. The fixed-prefix `EncodeCs1`, `DecodeCs1` and
-`IsCs1` remain for legacy notes; `DecodeAnyCs1` and `IsAnyCs1` accept either
-form during migration. Verification accepts both forms, matching the reference
-kit; decode the certificate separately if the application needs to compare its
-carried amount with another value.
+All-zero `aux_rand` makes a `ck1` a deterministic function of the key and the
+domain, so seed recovery reproduces it byte for byte. `ck1`s signed before
+spends moved onto the sighash (over `sha256("LNURLcash")`, over the raw
+string, or the 65-byte recoverable ECDSA shape) are still read, and
+`VerifySpend` and `RecoverNoteOwnershipPubkey` report them as `Legacy`:
+rotate those notes into a current `ck1`.
+
+`EncodeCw1`, `DecodeCw1`, `OutputKeyOfCw1` and `BearerCw1` handle script-path
+spends; `KeyPathSighash`, `ScriptPathSighash` and `SpendSigMsg` give the hash
+a signer inside a leaf needs. There is no script interpreter: a bearer
+hashlock is the one leaf this package evaluates, and any other `cw1` is
+checked for structure, `Q` and LUD-25's leaf rules (`CheckLeafPolicy`), then
+reported as `Unevaluated`. The mint judges its witness, and its time claim
+against its own clock (`CheckTimeClaim` predicts the answer).
+
+A certificate, `cs1…`, carries the amount in its prefix by BOLT 11 amount
+rules and signs `LNURLcash:<amount_msat>:<hex(Q)>`. A recipient checks a note
+offline from its URL alone:
+
+```go
+amount, certified := lnurlcash.VerifyNoteURL(noteURL, mintPubkey)
+// or piecewise:
+certified = lnurlcash.VerifyNoteSignature(k1, noteURL, amountMsat, cs1, mintPubkey)
+```
+
+`VerifyNoteSignature` returns a `Certification`: `CertifiedOverQ`, as LUD-25
+specifies; `CertifiedOverHash` for a bearer note certified over its `h` by a
+mint from before notes were keyed by `Q`; or `NotCertified`. It checks that
+`k1` opens its note at the URL's domain first. `VerifyNoteSignatureHash`
+takes a bearer note's `h` instead, and `VerifyNoteSignatureForKey` a `hex(Q)`,
+for a watcher that holds no spend. A certificate proves issuance, not that the
+note is still outstanding: rotate a received note once online.
+
+`EncodeCs1WithAmount`, `DecodeCs1WithAmount` and `IsCs1WithAmount` are the
+current wire API; the fixed-prefix `EncodeCs1`, `DecodeCs1` and `IsCs1` remain
+for legacy certificates, and `DecodeAnyCs1` and `IsAnyCs1` accept either.
+
+On the wire, a spend goes anywhere a `k1` does. An output, a `cp1` or a
+bearer `h`, goes as `p1`/`p2` on a rotate, split or merge, as `p` on a lookup,
+and as the comment on a mint invoice (a bearer `h` also as `h`, for mints that
+took that parameter first). A `cp1` whose key is not a curve point is refused
+before anything is sent.
 
 Reference-mint address management proves control with the address branch's
-index-0 private key. `SignAddressProof(sk0, action, username)` returns the raw
-64-byte BIP-340 proof over `sha256("LNURLcash:<action>:<username>")`; action is
-`register` or `unregister`, and the username must be normalised exactly as it
-is sent to the service.
+index-0 key. `SignAddressProof(sk0, action, domain, username)` returns the raw
+64-byte BIP-340 proof over `sha256("LNURLcash:<action>:<domain>:<username>")`;
+action is `register` or `unregister`, the domain is the mint's own, and the
+username must be normalised exactly as it is sent to the service.
 
-A `ck1` goes anywhere a `k1` does: a note URL, `FetchNoteInfo`, rotate, split,
-merge and melt. A `cp1` goes anywhere an output does: `RequestMintInvoiceWithHash`
-sends it as the comment alone, and the `*WithHash` calls send it as `p1`/`p2`
-while a hash keeps `h`/`h2`. `NoteIDOf(k1)` is the id a mint files either kind
-under - compare notes by it, never by `k1` - and `NoteLookupOf(k1)` is what
-to pass `FetchNoteInfoByHash`. A `ck1` is deterministic from its note key, so
-seed recovery reproduces it byte for byte. `DecodeCk1` and the lookup helpers
-also accept the old 65-byte recoverable-ECDSA shape, and a 96-byte proof
-signed over the raw message rather than its digest, so existing notes remain
-spendable; rotate those into a current `ck1` rather than issuing new legacy
-values.
+About the address branch:
 
 - **The branch is the spec's literal path.** `m/139'/d1/d2/d3/d4`, hashing
   key at `m/139'/0`: the same node `DeriveCashDomainNode` returns. Notes
@@ -270,7 +310,8 @@ values.
 identity key instead of a seed phrase: `HMAC-SHA256(key, "LNURLcash/nostr-seed")`,
 then the path above. That is ours, not LUD-25's, and heartwood-esp32 derives
 the same branch on the device. Both are graded against conformance's
-`part2.json` and `nostr-seed.json`, every field.
+`part2.json` and `nostr-seed.json`, every field, and the spends against
+`spends.json` and LUD-25's own published vectors (`spec-vectors.json`).
 
 ## Amounts
 
