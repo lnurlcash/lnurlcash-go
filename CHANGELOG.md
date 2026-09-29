@@ -3,7 +3,7 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## Unreleased
+## 0.2.0 - 2026-09-29
 
 **Breaking.** All four changes below alter public signatures or derived
 values, and a `ck1`/`cx1` produced by 0.1.0 is not what this version produces.
