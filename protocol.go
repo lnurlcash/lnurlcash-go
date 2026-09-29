@@ -22,14 +22,14 @@ import (
 // Request is one GET, and the secrets whose loss would destroy money.
 //
 // For a rotate, split or merge, ParseMutation wants the whole Request back:
-// the URL records which outputs were cp1 keys, and so which are owed a
+// the URL records which outputs were named by cp1, and so which are owed a
 // certificate.
 type Request struct {
 	URL string
-	// NewSecrets are the fresh wallet-generated secrets this request disclosed
-	// the hashes of. If the outcome turns out to be unknown they may be the only
-	// copies of notes the service has already minted, so persist them before
-	// performing the GET.
+	// NewSecrets are the fresh wallet-generated bearer preimages this request
+	// disclosed the hashes of. If the outcome turns out to be unknown they may
+	// be the only copies of notes the service has already minted, so persist
+	// them before performing the GET.
 	NewSecrets []string
 }
 
@@ -37,20 +37,20 @@ type Request struct {
 // it does. The zero value is the default, and the right one against a mint
 // that follows the current draft.
 //
-// LUD-25 Part 2 certifies cp1 notes only. A rotate, split or merge to a cp1
-// output owes that output its cs1 certificate, and this package always
-// insists on it: nothing here waives it. A legacy hash output carries the raw
-// Part 1 signature when the reference mint has a signer, and may be unsigned
-// in its no-signer mode.
+// LUD-25 has a service certify every note it issues (a SHOULD), a bearer note
+// included, since every note now has a public Q. This package goes further for
+// an output the caller named by cp1: a rotate, split or merge to one owes it
+// its cs1, always, because offline verification is the reason to name a note
+// that way, and nothing here waives it. An output named by a bearer note's hex
+// h may come back uncertified, as it does from a mint with no signer.
 type Policy struct {
-	// RequireSignatures demands the raw Part 1 signature over a legacy hash
-	// output, matching the committed reference wallet. Off by default to admit
-	// the reference mint's no-signer mode.
+	// RequireSignatures demands a certificate for an output named by a bearer
+	// note's hex h too. Off by default to admit a mint with no signer.
 	RequireSignatures bool
 
 	// AllowMissingMintPubkey admits a withdrawRequest that publishes no
-	// mintPubkey, or one that is not a compressed secp256k1 key: a Part
-	// 1-only mint, say. Named for what it permits rather than what it
+	// mintPubkey, or one that is not a compressed secp256k1 key: a mint that
+	// certifies nothing, say. Named for what it permits rather than what it
 	// demands, so the zero-value Policy is the strict one and a caller has to
 	// say the dangerous thing out loud. Without that key a cs1 verifies
 	// against nothing, so nothing such a mint issues can be checked offline.
@@ -103,12 +103,15 @@ type WithdrawInfo struct {
 	MaxWithdrawableMsat int64
 	MinWithdrawableMsat int64
 	DefaultDescription  string
-	// MintPubkey is the key this service's note signatures verify against: a
-	// cp1 note's cs1, or the raw Part 1 signature over a legacy hash.
+	// MintPubkey is the key this service's certificates verify against.
 	//
 	// A conforming service always publishes it here. Only ever empty, or not
 	// a compressed key, when the caller's Policy set AllowMissingMintPubkey.
 	MintPubkey string
+	// Signature is the service's certificate for the queried note, its c: a
+	// cs1 over hex(Q) and the note's value, or empty when it gave none. Passed
+	// through as sent; VerifyNoteSignature is the check.
+	Signature string
 }
 
 // MintAddress is the experimental withdraw-side discovery response.
@@ -167,7 +170,7 @@ type PayRequest struct {
 	HasMintFee bool
 	// CommentAllowed is LUD-12's field and LUD-25's minting capability, valid
 	// only when HasCommentAllowed is true. A mint must allow the 64 characters
-	// a hex-encoded SHA-256 commitment needs.
+	// a bearer note's hex h needs; a cp1 is 61.
 	CommentAllowed    int64
 	HasCommentAllowed bool
 	// MintToHash is an additive ForgeSworn extension: the service also accepts
@@ -176,8 +179,8 @@ type PayRequest struct {
 	MintToHash bool
 }
 
-// MintCommentLength is the exact comment capacity minting needs: 32 bytes as
-// lowercase hex.
+// MintCommentLength is the comment capacity minting needs: a bearer note's h,
+// 32 bytes as lowercase hex. A cp1 is 61 characters, so it fits the same.
 const MintCommentLength = 64
 
 // NamesMintOutput reports whether this service can mint a current-draft LUD-25
@@ -208,12 +211,12 @@ type InvoiceStatus struct {
 
 // Mutation is a mutating callback's answer.
 type Mutation struct {
-	// Signature is sig, over the output. For a cp1 output it is the cs1
-	// certificate, and never empty: ParseMutation refuses the answer without
-	// it. For a legacy hash output it is the raw Part 1 signature, or empty
-	// only when a no-signer mint is accepted by policy.
+	// Signature is c, the cs1 certificate over the output's hex(Q). For an
+	// output named by cp1 it is never empty: ParseMutation refuses the answer
+	// without it. For one named by a bearer note's hex h it is empty only when
+	// the Policy admits a mint with no signer.
 	Signature string
-	// ChangeSignature is sig2, the same for a split's change.
+	// ChangeSignature is c2, the same for a split's change.
 	ChangeSignature string
 	// PR and VerifyURL form the optional LUD-25 melt proof.
 	PR        string
@@ -263,6 +266,15 @@ func rejectError(body map[string]any) error {
 		return &ServiceError{Reason: reason}
 	}
 	return nil
+}
+
+// certificate reads a certificate under its current name, falling back to the
+// legacy one a service from before LUD-25 50d740a still sends (sig, sig2).
+func certificate(body map[string]any, key, legacy string) string {
+	if value := str(body, key); value != "" {
+		return value
+	}
+	return str(body, legacy)
 }
 
 func str(body map[string]any, key string) string {
@@ -325,7 +337,7 @@ func msat(body map[string]any, key string) (int64, bool) {
 // NoteInfoRequest builds the LUD-03 informational GET. It never burns, rotates
 // or alters the note.
 //
-// sig is stripped before the request: it is only meaningful to a holder
+// c (or the legacy sig) is stripped before the request: it is only meaningful to a holder
 // inspecting the note locally, since the service already knows what it signed.
 // k1 and amount are left as they are.
 func NoteInfoRequest(noteURL string) (Request, error) {
@@ -336,7 +348,8 @@ func NoteInfoRequest(noteURL string) (Request, error) {
 	pairs := parseOrdered(parsed.RawQuery)
 	kept := pairs[:0]
 	for _, pair := range pairs {
-		if pair[0] != "sig" {
+		// c is the certificate; sig is the legacy name of it
+		if pair[0] != "c" && pair[0] != "sig" {
 			kept = append(kept, pair)
 		}
 	}
@@ -371,11 +384,11 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 			return WithdrawInfo{}, invalid
 		}
 	}
-	// Spec MUST: the response's k1 is the bearer secret itself, never a derived
+	// Spec MUST: the response's k1 is the echoed spend itself, never a derived
 	// or opaque id. A service returning something else for the k1 it was queried
 	// with is non-compliant - or the note was rotated by somebody else, which
 	// matters more.
-	if queried := NoteK1(queriedURL); queried != "" && !sameNote(k1, queried) {
+	if queried := NoteK1(queriedURL); queried != "" && !sameNote(k1, queried, queriedURL) {
 		return WithdrawInfo{}, &ProtocolError{
 			Detail: "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant",
 		}
@@ -398,23 +411,27 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 		MinWithdrawableMsat: minimum,
 		DefaultDescription:  str(parsed, "defaultDescription"),
 		MintPubkey:          strings.ToLower(strings.TrimSpace(mintPubkey)),
+		Signature:           certificate(parsed, "c", "sig"),
 	}, nil
 }
 
-// sameNote reports whether two k1s name one note. Exact spelling is preferred;
-// valid ck1 values may also be compared by their verified embedded note key.
-// A k1 with no note id at all still has to come back as the same string.
-func sameNote(a, b string) bool {
+// sameNote reports whether two k1s name one note at the mint noteURL is on.
+// Exact spelling is preferred. A different spelling is the same note only when
+// both open the same Q there: one note may have several valid spends (a short
+// form and its cw1, another leaf, an older ck1), but a ck1 that does not
+// verify for this mint names nothing a wallet should hold. A k1 that is no
+// spend at all still has to come back as the same string.
+func sameNote(a, b, noteURL string) bool {
 	if strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b)) {
 		return true
 	}
-	idA, errA := NoteIDOf(a)
-	idB, errB := NoteIDOf(b)
-	return errA == nil && errB == nil && idA == idB
+	spendA, errA := VerifySpend(strings.ToLower(strings.TrimSpace(a)), noteURL)
+	spendB, errB := VerifySpend(strings.ToLower(strings.TrimSpace(b)), noteURL)
+	return errA == nil && errB == nil && spendA.OutputKey == spendB.OutputKey
 }
 
 // ParseNoteInfoByHash reads the same response, for a lookup that named the
-// note by its hash - or, for a Part 2 note, by its cp1.
+// note by its cp1 or a bearer note's hex h.
 //
 // Differs from ParseNoteInfo in exactly two places, both because there was no
 // secret in the request: k1 is not required in the response, and there is no
@@ -464,6 +481,7 @@ func ParseNoteInfoByHash(body []byte, policy Policy) (WithdrawInfo, error) {
 		MinWithdrawableMsat: minimum,
 		DefaultDescription:  str(parsed, "defaultDescription"),
 		MintPubkey:          strings.ToLower(strings.TrimSpace(mintPubkey)),
+		Signature:           certificate(parsed, "c", "sig"),
 	}, nil
 }
 
@@ -555,30 +573,23 @@ func MeltRequest(callback, k1, pr string) (Request, error) {
 	return Request{URL: built}, nil
 }
 
-// outputParam names a mutation's output. An output is a hash, or a Part 2 cp1
-// key. LUD-25 renamed the callback's h and h2 to p1 and p2; a hash keeps the
-// old names, which every mint accepts, and a key goes as p1 or p2, which only a
-// Part 2 mint takes anyway. Decided per value, never by a version flag - the
-// same rule as lnurl-wallet - and the value goes out exactly as given, so a
-// retried request stays byte-identical.
+// outputParam names a mutation's output: p1, or p2 for a split's change, as
+// LUD-25 spells them, whether the value is a cp1 or a bearer note's hex h (its
+// cp1 short form). Mints from before the rename also read h and h2, but every
+// current one reads p1 and p2 for both. The value goes out exactly as given,
+// so a retried request stays byte-identical.
 //
-// A k1 needs no such treatment: a Part 1 secret and a Part 2 ck1 both go as
+// A k1 needs no such treatment: a ck1, a cw1 and a bearer preimage all go as
 // k1, and the service tells them apart by shape.
 func outputParam(value string, which int) [2]string {
-	if IsCp1(strings.ToLower(strings.TrimSpace(value))) {
-		return [2]string{"p" + strconv.Itoa(which), value}
-	}
-	if which == 2 {
-		return [2]string{"h2", value}
-	}
-	return [2]string{"h", value}
+	return [2]string{"p" + strconv.Itoa(which), value}
 }
 
-// RotateRequestWithHash builds a rotate for a hash the caller already holds -
-// what a hardware wallet drives, where the secret never enters this process.
+// RotateRequestWithHash builds a rotate to an output the caller already names
+// - what a hardware wallet drives, where the secret never enters this process.
 //
-// k1 may be a Part 2 ck1, and h a Part 2 cp1, which goes as p1: a rotate into
-// a key the wallet derived and the service only ever learns the public half of.
+// k1 is any spend, and h a bearer note's hex h or a cp1: a rotate into a key
+// the wallet derived, say, whose public half is all the service ever learns.
 func RotateRequestWithHash(callback, k1, h string) (Request, error) {
 	built, err := callbackURL(callback, [][2]string{{"k1", k1}, outputParam(h, 1)})
 	if err != nil {
@@ -587,8 +598,8 @@ func RotateRequestWithHash(callback, k1, h string) (Request, error) {
 	return Request{URL: built}, nil
 }
 
-// SplitRequestWithHash builds a split for hashes the caller already holds.
-// Either output may be a cp1, and the two need not be the same kind.
+// SplitRequestWithHash builds a split to outputs the caller already names.
+// Either may be a cp1 or a bearer note's hex h, and the two need not match.
 func SplitRequestWithHash(callback string, k1s []string, amountMsat int64, h, h2 string) (Request, error) {
 	params := make([][2]string, 0, len(k1s)+3)
 	for _, k1 := range k1s {
@@ -606,8 +617,8 @@ func SplitRequestWithHash(callback string, k1s []string, amountMsat int64, h, h2
 	return Request{URL: built}, nil
 }
 
-// MergeRequestWithHash builds a merge for a hash the caller already holds. The
-// inputs may mix Part 1 secrets and Part 2 ck1s, and the output may be a cp1.
+// MergeRequestWithHash builds a merge to an output the caller already names.
+// The inputs may mix any spends, and the output may be a cp1 or a hex h.
 func MergeRequestWithHash(callback string, k1s []string, h string) (Request, error) {
 	params := make([][2]string, 0, len(k1s)+1)
 	for _, k1 := range k1s {
@@ -623,10 +634,11 @@ func MergeRequestWithHash(callback string, k1s []string, h string) (Request, err
 
 // The generating variants.
 //
-// Per LUD-25 the wallet generates the replacement secret and discloses only its
-// hash. The service never sees, generates or persists it, which is what closes
-// the prior-holder exposure a service-generated replacement would otherwise
-// reopen on every single rotate.
+// Per LUD-25 the wallet generates every resulting note itself and discloses
+// only its public name: here a bearer note, whose preimage is drawn fresh and
+// whose h goes out as p1 or p2. The service never sees, generates or persists
+// the preimage, which is what closes the prior-holder exposure a
+// service-generated replacement would otherwise reopen on every single rotate.
 //
 // The secrets are passed in rather than drawn here, so a hardware wallet can
 // supply them from its own RNG and a test can be deterministic.
@@ -685,9 +697,9 @@ func MergeRequest(callback string, k1s []string, newSecret string) (Request, err
 // NewSecrets are attached to any ambiguous outcome so nothing can lose them
 // between the call and the check.
 //
-// A confirmed rotate, split or merge that owes a signature and did not return
-// one is an UnverifiableError. A cp1 output always owes its cs1; a hash output
-// requires the raw Part 1 signature when the Policy asks for it. Which
+// A confirmed rotate, split or merge that owes a certificate and did not
+// return one is an UnverifiableError. An output named by cp1 always owes its
+// cs1; one named by a bearer note's hex h owes it when the Policy asks. Which
 // outputs were cp1 is read off request.URL - see certifiedOutputs.
 func ParseMutation(body []byte, request Request, kind MutationKind, policy Policy) (Mutation, error) {
 	newSecrets := request.NewSecrets
@@ -719,7 +731,7 @@ func ParseMutation(body []byte, request Request, kind MutationKind, policy Polic
 			NewSecrets: newSecrets,
 		}
 	}
-	signature, changeSignature := str(parsed, "sig"), str(parsed, "sig2")
+	signature, changeSignature := certificate(parsed, "c", "sig"), certificate(parsed, "c2", "sig2")
 	if err := unsignedOutput(request, kind, policy, signature, changeSignature); err != nil {
 		return Mutation{}, err
 	}
@@ -732,13 +744,13 @@ func ParseMutation(body []byte, request Request, kind MutationKind, policy Polic
 }
 
 // unsignedOutput finds the first output of a confirmed mutation that came back
-// without the signature its kind is owed, in output order so the error names
-// the one actually missing.
+// without the certificate its naming is owed, in output order so the error
+// names the one actually missing.
 //
-// A cp1 output is owed its cs1 whatever the Policy says. A legacy hash uses a
-// raw Part 1 signature when available and is refused without one only when the
-// caller enabled strict reference-wallet parity. A signature that is present
-// is passed through either way. A melt mints nothing and owes nothing.
+// An output named by cp1 is owed its cs1 whatever the Policy says. One named
+// by a bearer note's hex h is refused without one only when the caller asked
+// for RequireSignatures. A certificate that is present is passed through
+// either way. A melt mints nothing and owes nothing.
 //
 // The mutation has already landed by the time this is checked - status was OK
 // - so the refusal carries the caller's secrets out with it, or enforcing the
@@ -763,7 +775,7 @@ func unsignedOutput(request Request, kind MutationKind, policy Policy, signature
 		case output.cp1:
 			return &UnverifiableError{
 				Detail: fmt.Sprintf(
-					"the service confirmed the %s but returned no cs1 certificate for the cp1 note it minted, which LUD-25 Part 2 requires, so that note cannot be verified offline. The note exists - keep its key",
+					"the service confirmed the %s but returned no cs1 certificate for the cp1 note it minted, so that note cannot be verified offline. The note exists - keep its key",
 					output.what,
 				),
 				NewSecrets: request.NewSecrets,
@@ -781,9 +793,10 @@ func unsignedOutput(request Request, kind MutationKind, policy Policy, signature
 	return nil
 }
 
-// certifiedOutputs reports which of a mutation's outputs are Part 2 keys: p1
-// names the output and p2 a split's change, and outputParam only ever sends a
-// cp1 under either.
+// certifiedOutputs reports which of a mutation's outputs were named by cp1:
+// p1 names the output and p2 a split's change. A hex h under either, or under
+// the old h and h2 of a request persisted by an earlier version, is a bearer
+// output and owes a certificate only by Policy.
 //
 // Read off the URL rather than kept in a field of its own. The URL is the
 // record of what the service was actually asked to mint, and it is what a
@@ -878,20 +891,21 @@ func InvoiceRequest(payCallback string, amountMsat int64) (Request, error) {
 }
 
 // MintInvoiceRequestWithHash asks for a mint invoice, naming the note it will
-// credit with h = sha256(secret).
+// credit: a bearer note's h = sha256(preimage), or a cp1.
 //
-// LUD-25 carries the commitment as a mandatory LUD-12 comment; h repeats the
-// identical value for services that took the parameter form first. It is never
-// an alternative to the comment.
+// LUD-25 carries the name as a mandatory LUD-12 comment; for a hex h, the h
+// parameter repeats the identical value for services that took the parameter
+// form first. It is never an alternative to the comment.
 //
-// The service learns a hash and nothing else, so the payment preimage is
-// settlement proof only - it can never redeem the note. That is the whole point
-// of the current draft: a preimage propagates to every routing node that
-// forwards the payment, and a note keyed by one is a note they can all spend.
+// The service learns a public name and nothing else, so the payment preimage
+// is settlement proof only - it can never redeem the note. That is the whole
+// point: a payment preimage propagates to every routing node that forwards the
+// payment, and a note keyed by one is a note they can all spend.
 //
-// h may instead be a Part 2 cp1, minting to a key. That goes as the comment
-// alone: h is a hash-only extension, and a mint may refuse a key under it. A
-// cp1 is 61 characters, so it fits the same 64 a mint must allow.
+// A cp1 goes as the comment alone: the h parameter is a hash-only extension,
+// and a mint may refuse a key under it. A cp1 is 61 characters, so it fits the
+// same 64 a mint must allow, and one whose key is not a curve point is refused
+// here, before anything is paid into a note nobody could ever spend.
 func MintInvoiceRequestWithHash(payCallback string, amountMsat int64, h string) (Request, error) {
 	h = strings.ToLower(strings.TrimSpace(h))
 	params := [][2]string{{"amount", strconv.FormatInt(amountMsat, 10)}, {"comment", h}}
@@ -903,7 +917,7 @@ func MintInvoiceRequestWithHash(payCallback string, amountMsat int64, h string) 
 	default:
 		// Refused here rather than sent, so a wallet never pays for a quote the
 		// service was always going to reject.
-		return Request{}, fmt.Errorf("%w: an output must be 32 bytes of hex or a cp1 key - no invoice was requested", ErrRequestRefused)
+		return Request{}, fmt.Errorf("%w: an output must be a bearer note's 32-byte hex h or a cp1 naming a curve point - no invoice was requested", ErrRequestRefused)
 	}
 	built, err := withParams(payCallback, params)
 	if err != nil {

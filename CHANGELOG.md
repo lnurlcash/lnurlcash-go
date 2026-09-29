@@ -5,8 +5,89 @@ carry breaking changes; pin an exact version.
 
 ## Unreleased
 
-**Breaking.** All three changes below alter public signatures or derived
+**Breaking.** All four changes below alter public signatures or derived
 values, and a `ck1`/`cx1` produced by 0.1.0 is not what this version produces.
+
+### Derivation purposes, `c`/`c2` and `text/cpub` (LUD-25 `50d740a`)
+
+**Breaking.** Note keys derived by earlier builds are not what this version
+derives, and the derivation functions take a purpose. Graded against the
+`lnurlcash-conformance` 0.15.0 vectors, which also carry the superseded
+scheme as a negative.
+
+- The note tweak is `t = tagged_hash("LNURLcash/derive", P || chaincode ||
+  ser32(purpose) || ser32(i)) mod n`. `DeriveNotePubkey` and
+  `DeriveNoteSecretKey` take `purpose` before `i`, with the constants
+  `NotePurposeWallet` (0: wallet notes, a split's `p1`, the address proof key
+  at index 0), `NotePurposeChange` (1: a split's `p2`) and
+  `NotePurposeLightningAddress` (2: auto-mint and internal transfer).
+- Certificates are `c` (and `c2` for a split's change) in withdraw responses
+  and on the informational GET, and a certified note URL carries `&c=`. New
+  URLs and rewrites emit `c`; the legacy `sig`, `sig2` and `&sig=` are still
+  read. The registration-proof request parameter stays `sig`.
+- The internal-transfer hint is `text/cpub` (formerly `text/xpub`). This module
+  does not parse payRequest metadata, so there is no code change; callers
+  should accept both.
+
+### Every note is a taproot output key (LUD-25 `6e865b1`)
+
+LUD-25's unified taproot model (luds `6e865b1`, "unified taproot
+verification"): every note is a BIP-341 output key `Q`, named `cp1<Q>` and
+filed by the mint under `hex(Q)`, and a `k1` is a spend of it. A bearer note
+is the one-leaf hashlock `OP_SHA256 <h> OP_EQUAL` under BIP-341's NUMS key, so
+its 64-hex preimage and hex `h` keep working as short forms. Graded against
+`lnurlcash-conformance` 0.14.0: LUD-25's own vectors 1 to 5, the new
+`spends.json`, and the regenerated `part2.json` and `nostr-seed.json`, plus
+the mock mint's new model. No dependency was added: the canonical spend
+transaction never changes shape, so its sighash is built by hand.
+
+- New `spend.go`: `SpendDomainOf`, `SpendPrevout`, `SpendSigMsg`,
+  `KeyPathSighash`, `ScriptPathSighash`, `TapLeafHash`, `TaprootTweak`,
+  `OutputKeyOf` (merkle fold, tweak and parity check), `IsXOnlyPoint`,
+  `NumsKey`, `BearerLeaf`, `BearerNoteOf`, `BearerNoteID`, `BearerCw1`, the
+  `Cw1` codec (`EncodeCw1`, `DecodeCw1`, `IsCw1`, `OutputKeyOfCw1`),
+  `CheckLeafPolicy`, `CheckTimeClaim`, and `DecodeSpend` and `VerifySpend`,
+  which checks a spend the way a mint would, time claims aside. There is no
+  script interpreter: a `cw1` whose leaf is not a bearer hashlock is checked
+  for structure, `Q` and the leaf rules and reported `Unevaluated`.
+- `SignNoteOwnership(sk, domain)` signs the key-path sighash for the mint's
+  domain, with all-zero `aux_rand`, so a key has one `ck1` per mint and it
+  fails at every other. `RecoverNoteOwnershipPubkey(payload, domain)` returns
+  `NoteOwnership{PubkeyXOnly, Legacy}`, still reading `ck1`s signed over
+  `sha256("LNURLcash")`, over the raw string, and the 65-byte recoverable
+  shape, reported `Legacy`. `NoteOwnershipMessage` is removed.
+- `NoteIDOf` returns `hex(Q)` for every spend, a bearer preimage included
+  (it was `sha256(k1)`), and names the note without verifying the spend.
+  `NoteLookupOf` gives a bearer preimage's `h`, or a `cp1` for anything else.
+- Certificates are over `hex(Q)` for every note. `VerifyNoteSignature(k1,
+  domain, amountMsat, sig, mintPubkey)` checks the spend opens its note at
+  the domain, then the certificate, and returns a `Certification`:
+  `CertifiedOverQ`, `CertifiedOverHash` for a bearer note certified over its
+  `h` by a mint from before taproot, or `NotCertified`.
+  `VerifyNoteSignatureHash` now takes a bearer note's `h` (over `Q`, then
+  `h`); the new `VerifyNoteSignatureForKey` takes `hex(Q)`, for a watcher.
+  New `VerifyNoteURL` makes the whole offline check from a note URL.
+- `AddressProofMessage`, `AddressProofDigest` and `SignAddressProof` take the
+  mint's domain: `LNURLcash:<action>:<domain>:<username>`.
+- Outputs go as `p1`/`p2` and lookups as `p` whatever they are, a `cp1` or a
+  bearer `h`, as LUD-25 spells them (a hex `h` went as `h`/`h2` and `?h=`).
+  Every current mint reads both spellings. A persisted request using the old
+  names is still read correctly by `ParseMutation`.
+- A `cp1` whose key is not a curve point no longer decodes, so a mint invoice
+  to one is refused before anything is paid.
+- `ResolveNoteInput` and the informational GET's echo check verify the spend
+  at the note URL's own domain, so a `ck1` for another mint, or the right key
+  under a broken signature, is not taken for the note.
+- `WithdrawInfo.Signature` carries the certificate the informational GET now
+  hands out. `ErrOutputInUse` (and `ServiceError.OutputInUse`) is LUD-25's
+  `already in use`: an output is taken, nothing was burned. Matched as a
+  phrase, so lnurl-mint's `Output already in use.` counts too.
+- An output named by a `cp1` still owes its `cs1` whatever the `Policy`,
+  although LUD-25 now makes certification a SHOULD for every note: offline
+  verification is the reason to name a note that way.
+- A note tweak `t >= n` is reduced mod n, as LUD-25 requires and
+  lnurl-wallet does, instead of refusing the index. A ~2^-128 event.
+- CI pins `lnurlcash-conformance` `v0.14.0`.
 
 ### Ownership and address proofs sign a sha256 digest, not the raw message
 
