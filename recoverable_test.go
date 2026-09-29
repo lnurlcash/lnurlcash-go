@@ -155,7 +155,7 @@ func TestLooksEveryNoteUpByP(t *testing.T) {
 	// A lookup exists to disclose as little as possible, amount=0 included:
 	// a strict mint may refuse a placeholder rather than ignore it.
 	for _, query := range []url.Values{byKey, byHash} {
-		for _, dropped := range []string{"k1", "amount", "sig"} {
+		for _, dropped := range []string{"k1", "amount", "c", "sig"} {
 			if query.Has(dropped) {
 				t.Errorf("a lookup carried %s: %v", dropped, query)
 			}
@@ -254,10 +254,60 @@ func legacyCk1(t *testing.T, secretKeyHex string) string {
 	return encoded
 }
 
-// rawMessageCk1 is part2.json's first note (index 0 of mint.example) as
-// lnurlcash-conformance 0.12.0 spelled it: the same key, but a BIP-340
-// signature over the raw 9-byte "LNURLcash" rather than the spend sighash.
-const rawMessageCk1 = "ck12e7xv2ca3njkjwuun6zm4u4v3ven69hfc33nmaxcemns7g9y7qeklrf8ych23gfjn0zt4k5g6ghfehepjte5ws7gcxqthg8965zfwazua5564jxx4fjwn3a78j2t55y24l03s7ldw2kmn672wrg5xq790yz4088e"
+// rawMessageCk1 is a note's ck1 as lnurlcash-conformance 0.12.0 spelled it: the
+// same key, but a BIP-340 signature over the raw 9-byte "LNURLcash" rather than
+// the spend sighash. Built here from the note's key, since the vectors moved to
+// derivation purposes and no longer carry it.
+func rawMessageCk1(t *testing.T, secretKeyHex string) string {
+	t.Helper()
+	// btcec's Sign takes a 32-byte hash only, so BIP-340 signing of a message
+	// of any length is written out, with all-zero auxiliary input.
+	taggedHash := func(tag string, parts ...[]byte) [32]byte {
+		tagHash := sha256.Sum256([]byte(tag))
+		h := sha256.New()
+		h.Write(tagHash[:])
+		h.Write(tagHash[:])
+		for _, part := range parts {
+			h.Write(part)
+		}
+		var out [32]byte
+		h.Sum(out[:0])
+		return out
+	}
+	scalarOf := func(b [32]byte) *secp256k1.ModNScalar {
+		var s secp256k1.ModNScalar
+		s.SetBytes(&b)
+		return &s
+	}
+	message := []byte("LNURLcash")
+	private, public := btcec.PrivKeyFromBytes(hexBytes(t, secretKeyHex, 32))
+	px := schnorr.SerializePubKey(public)
+	d := new(secp256k1.ModNScalar).Set(&private.Key)
+	if public.SerializeCompressed()[0] == secp256k1.PubKeyFormatCompressedOdd {
+		d.Negate()
+	}
+	dBytes := d.Bytes()
+	auxHash := taggedHash("BIP0340/aux", make([]byte, 32))
+	masked := make([]byte, 32)
+	for i := range masked {
+		masked[i] = dBytes[i] ^ auxHash[i]
+	}
+	nonce := taggedHash("BIP0340/nonce", masked, px, message)
+	k := scalarOf(nonce)
+	rPoint := secp256k1.NewPrivateKey(k).PubKey()
+	if rPoint.SerializeCompressed()[0] == secp256k1.PubKeyFormatCompressedOdd {
+		k.Negate()
+	}
+	rx := schnorr.SerializePubKey(rPoint)
+	e := scalarOf(taggedHash("BIP0340/challenge", rx, px, message))
+	s := new(secp256k1.ModNScalar).Mul2(e, d).Add(k)
+	sBytes := s.Bytes()
+	var payload [96]byte
+	copy(payload[:32], px)
+	copy(payload[32:64], rx)
+	copy(payload[64:], sBytes[:])
+	return lnurlcash.EncodeCk1(payload)
+}
 
 // digestMessageCk1 is the same note as lnurlcash-conformance 0.13 spelled it,
 // the form current until spends moved onto the sighash: a BIP-340 signature
@@ -329,7 +379,7 @@ func TestALegacyCk1StaysReadableForRotation(t *testing.T) {
 func TestFixedMessageCk1sStayReadableForRotation(t *testing.T) {
 	part2 := loadPart2(t)
 	for name, ck1 := range map[string]string{
-		"raw message":    rawMessageCk1,
+		"raw message":    rawMessageCk1(t, part2.a.NoteSecretKey),
 		"sha256 message": digestMessageCk1(t, part2.a.NoteSecretKey),
 	} {
 		if ck1 == part2.a.Ck1 {
@@ -380,7 +430,7 @@ func TestAnEchoedCk1IsComparedByTheNoteItNames(t *testing.T) {
 		})
 		return body
 	}
-	for _, spelling := range []string{legacyCk1(t, part2.a.NoteSecretKey), rawMessageCk1, digestMessageCk1(t, part2.a.NoteSecretKey)} {
+	for _, spelling := range []string{legacyCk1(t, part2.a.NoteSecretKey), rawMessageCk1(t, part2.a.NoteSecretKey), digestMessageCk1(t, part2.a.NoteSecretKey)} {
 		if _, err := lnurlcash.ParseNoteInfo(answer(spelling), queried, lnurlcash.Policy{}); err != nil {
 			t.Errorf("another spelling of the same note was refused: %v", err)
 		}
@@ -410,11 +460,11 @@ func TestPart2RefusesWhatIsNotAKey(t *testing.T) {
 		beyondPrime[i] = 0xff
 	}
 
-	if _, err := lnurlcash.DeriveNotePubkey(beyondPrime, chainCode, 0); err == nil {
+	if _, err := lnurlcash.DeriveNotePubkey(beyondPrime, chainCode, lnurlcash.NotePurposeWallet, 0); err == nil {
 		t.Error("derived from a branch key that is no point's x")
 	}
 	for _, key := range [][32]byte{zero, n} {
-		if _, err := lnurlcash.DeriveNoteSecretKey(key, chainCode, 0); err == nil {
+		if _, err := lnurlcash.DeriveNoteSecretKey(key, chainCode, lnurlcash.NotePurposeWallet, 0); err == nil {
 			t.Errorf("derived from branch key %x", key)
 		}
 		if _, err := lnurlcash.SignNoteOwnership(key, part2.domain); err == nil {
@@ -580,7 +630,7 @@ func TestTheClientTakesPart2NotesEndToEnd(t *testing.T) {
 		base, seen := capture(t, map[string]any{
 			"tag": "withdrawRequest", "callback": "https://mint.example/w/cb",
 			"minWithdrawable": 21000, "maxWithdrawable": 21000,
-			"mintPubkey": part2.mintPubkey, "sig": part2.cs1,
+			"mintPubkey": part2.mintPubkey, "c": part2.cs1,
 		})
 		lookup, _ := lnurlcash.NoteLookupOf(part2.a.Ck1)
 		info, err := client.FetchNoteInfoByHash(background, base+"/w", lookup)
@@ -602,7 +652,7 @@ func TestTheClientTakesPart2NotesEndToEnd(t *testing.T) {
 	})
 
 	t.Run("mutations", func(t *testing.T) {
-		base, seen := capture(t, map[string]any{"status": "OK", "sig": part2.cs1, "sig2": part2.cs1})
+		base, seen := capture(t, map[string]any{"status": "OK", "c": part2.cs1, "c2": part2.cs1})
 		rotated, err := client.RotateNoteWithHash(background, base+"/w/cb", part2.a.Ck1, part2.b.Cp1)
 		if err != nil {
 			t.Fatal(err)
@@ -702,7 +752,7 @@ func TestAnUncertifiedCp1OutputIsUnverifiableWhateverThePolicy(t *testing.T) {
 	if _, err := lnurlcash.ParseMutation([]byte(`{"status":"OK"}`), rebuilt, lnurlcash.MutationRotate, lnurlcash.Policy{}); !lnurlcash.IsUnverifiable(err) {
 		t.Errorf("a rebuilt request lost the rule: %v", err)
 	}
-	certified := []byte(`{"status":"OK","sig":"` + part2.cs1 + `"}`)
+	certified := []byte(`{"status":"OK","c":"` + part2.cs1 + `"}`)
 	if mutation, err := lnurlcash.ParseMutation(certified, rebuilt, lnurlcash.MutationRotate, lnurlcash.Policy{}); err != nil || mutation.Signature != part2.cs1 {
 		t.Errorf("a certified cp1 output = %q (%v), want its cs1", mutation.Signature, err)
 	}
@@ -717,7 +767,7 @@ func TestACp1ChangeWithoutItsCertificateIsUnverifiable(t *testing.T) {
 	hash, _ := lnurlcash.HashK1(secret(0x11))
 	client := lnurlcash.NewClient()
 
-	firstOnly, _ := capture(t, map[string]any{"status": "OK", "sig": part2.cs1})
+	firstOnly, _ := capture(t, map[string]any{"status": "OK", "c": part2.cs1})
 	_, err := client.SplitNoteWithHash(ctx(t), firstOnly+"/w/cb", []string{part2.a.Ck1}, 5000, hash, part2.b.Cp1)
 	if !lnurlcash.IsUnverifiable(err) {
 		t.Fatalf("a cp1 change with no sig2 = %v, want unverifiable", err)
@@ -734,7 +784,7 @@ func TestACp1ChangeWithoutItsCertificateIsUnverifiable(t *testing.T) {
 	}
 
 	// and a split to two keys that certifies both is whole
-	both, _ := capture(t, map[string]any{"status": "OK", "sig": part2.cs1, "sig2": part2.cs1})
+	both, _ := capture(t, map[string]any{"status": "OK", "c": part2.cs1, "c2": part2.cs1})
 	if _, err := client.SplitNoteWithHash(ctx(t), both+"/w/cb", []string{part2.a.Ck1}, 5000, part2.b.Cp1, part2.c.Cp1); err != nil {
 		t.Errorf("a split certifying both keys was refused: %v", err)
 	}
@@ -796,4 +846,24 @@ func FuzzPart2Decoders(f *testing.F) {
 		_ = lnurlcash.VerifyNoteSignature(value, value, 1, value, value)
 		_ = lnurlcash.BuildNoteInfoURLByHash("https://mint.example/w", value)
 	})
+}
+
+// A certificate is c, and c2 for a split's change, from LUD-25 50d740a. A note
+// URL from before that carries sig, which is still read; anything written is c.
+func TestACertificateIsCAndTheLegacySigIsStillRead(t *testing.T) {
+	part2 := loadPart2(t)
+	current := "https://" + part2.domain + "/w?k1=" + part2.a.Ck1 + "&c=" + part2.cs1
+	legacy := "https://" + part2.domain + "/w?k1=" + part2.a.Ck1 + "&sig=" + part2.cs1
+	for _, noteURL := range []string{current, legacy} {
+		if got := lnurlcash.NoteSignature(noteURL); got != part2.cs1 {
+			t.Errorf("NoteSignature(%s) = %q, want the certificate", noteURL, got)
+		}
+		if got := lnurlcash.WithNewK1(noteURL, part2.a.Ck1, 1000, part2.cs1); got != current {
+			t.Errorf("a rewrite of %s = %s, want %s", noteURL, got, current)
+		}
+		request, err := lnurlcash.NoteInfoRequest(noteURL)
+		if err != nil || strings.Contains(request.URL, "c=") || strings.Contains(request.URL, "sig=") {
+			t.Errorf("the info GET for %s kept the certificate: %s (%v)", noteURL, request.URL, err)
+		}
+	}
 }

@@ -845,6 +845,7 @@ func loadVectorsStrict(t *testing.T, name string, target any) {
 }
 
 type part2Note struct {
+	Purpose          uint32 `json:"purpose"`
 	Index            uint32 `json:"index"`
 	NotePubkey       string `json:"notePubkey"`
 	Cp1              string `json:"cp1"`
@@ -859,20 +860,22 @@ type part2Vectors struct {
 	Spec        string `json:"spec"`
 	Description string `json:"description"`
 	Conventions struct {
-		AddressBranch               string `json:"addressBranch"`
-		HashingKey                  string `json:"hashingKey"`
-		SpecTextSays                string `json:"specTextSays"`
-		NoteTweak                   string `json:"noteTweak"`
-		IndexWidth                  string `json:"indexWidth"`
-		SpendDomain                 string `json:"spendDomain"`
-		CanonicalSpendTransaction   string `json:"canonicalSpendTransaction"`
-		Ck1Signs                    string `json:"ck1Signs"`
-		KeyPathSignature            string `json:"keyPathSignature"`
-		Ck1Payload                  string `json:"ck1Payload"`
-		AddressProofMessage         string `json:"addressProofMessage"`
-		AddressProofMessageEncoding string `json:"addressProofMessageEncoding"`
-		CertificateMessage          string `json:"certificateMessage"`
-		CertificateHrp              string `json:"certificateHrp"`
+		AddressBranch               string            `json:"addressBranch"`
+		HashingKey                  string            `json:"hashingKey"`
+		SpecTextSays                string            `json:"specTextSays"`
+		NoteTweak                   string            `json:"noteTweak"`
+		Purposes                    map[string]string `json:"purposes"`
+		PurposeUse                  string            `json:"purposeUse"`
+		IndexWidth                  string            `json:"indexWidth"`
+		SpendDomain                 string            `json:"spendDomain"`
+		CanonicalSpendTransaction   string            `json:"canonicalSpendTransaction"`
+		Ck1Signs                    string            `json:"ck1Signs"`
+		KeyPathSignature            string            `json:"keyPathSignature"`
+		Ck1Payload                  string            `json:"ck1Payload"`
+		AddressProofMessage         string            `json:"addressProofMessage"`
+		AddressProofMessageEncoding string            `json:"addressProofMessageEncoding"`
+		CertificateMessage          string            `json:"certificateMessage"`
+		CertificateHrp              string            `json:"certificateHrp"`
 	} `json:"conventions"`
 	Mint struct {
 		PrivateKey string `json:"privateKey"`
@@ -902,6 +905,22 @@ type part2Vectors struct {
 		Cx1           string      `json:"cx1"`
 		Notes         []part2Note `json:"notes"`
 	} `json:"branches"`
+	// PrePurpose is the scheme of luds 6e865b1, kept as a negative: what this
+	// package must no longer derive.
+	PrePurpose struct {
+		Superseded bool   `json:"superseded"`
+		Spec       string `json:"spec"`
+		NoteTweak  string `json:"noteTweak"`
+		Mnemonic   string `json:"mnemonic"`
+		Host       string `json:"host"`
+		Cx1        string `json:"cx1"`
+		Notes      []struct {
+			Index         uint32 `json:"index"`
+			NotePubkey    string `json:"notePubkey"`
+			Cp1           string `json:"cp1"`
+			NoteSecretKey string `json:"noteSecretKey"`
+		} `json:"notes"`
+	} `json:"prePurpose"`
 	Certificates []struct {
 		NotePubkey string `json:"notePubkey"`
 		AmountMsat int64  `json:"amountMsat"`
@@ -1001,7 +1020,7 @@ func gradeNote(t *testing.T, node lnurlcash.CashNode, watched lnurlcash.Cx1, not
 	t.Helper()
 
 	// the watcher, holding only the cx1
-	pubkey, err := lnurlcash.DeriveNotePubkey(watched.PubkeyXOnly, watched.ChainCode, note.Index)
+	pubkey, err := lnurlcash.DeriveNotePubkey(watched.PubkeyXOnly, watched.ChainCode, note.Purpose, note.Index)
 	if err != nil {
 		t.Fatalf("note pubkey: %v", err)
 	}
@@ -1010,7 +1029,7 @@ func gradeNote(t *testing.T, node lnurlcash.CashNode, watched lnurlcash.Cx1, not
 	}
 
 	// the holder, holding the node
-	secretKey, err := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, note.Index)
+	secretKey, err := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, note.Purpose, note.Index)
 	if err != nil {
 		t.Fatalf("note secret key: %v", err)
 	}
@@ -1212,6 +1231,27 @@ func TestPart2Vectors(t *testing.T) {
 	if !parities["even"] || !parities["odd"] {
 		t.Errorf("the branches cover parities %v; both even and odd are needed", parities)
 	}
+	// The scheme before derivation purposes is superseded: no purpose gives
+	// its keys back.
+	if old := vectors.PrePurpose; !old.Superseded || len(old.Notes) == 0 {
+		t.Error("part2.json no longer carries the superseded pre-purpose keys as a negative")
+	} else {
+		cx, err := lnurlcash.DecodeCx1(old.Cx1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, note := range old.Notes {
+			for _, purpose := range []uint32{lnurlcash.NotePurposeWallet, lnurlcash.NotePurposeChange, lnurlcash.NotePurposeLightningAddress} {
+				pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, purpose, note.Index)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if hex.EncodeToString(pk[:]) == note.NotePubkey {
+					t.Errorf("purpose %d index %d still derives the superseded key %s", purpose, note.Index, note.NotePubkey)
+				}
+			}
+		}
+	}
 	// i is a plain uint32, never hardened: both sides of 2^31, and the top.
 	for _, index := range []uint32{0x7fffffff, 0x80000000, 0xffffffff} {
 		if !indices[index] {
@@ -1346,12 +1386,13 @@ func TestPart2Vectors(t *testing.T) {
 // publishes, checked against this package's real functions.
 func TestSpecVectors(t *testing.T) {
 	type specNote struct {
-		Index uint32 `json:"index"`
-		T     string `json:"t"`
-		Q     string `json:"Q"`
-		Pk    string `json:"pk"`
-		Sk    string `json:"sk"`
-		Cp1   string `json:"cp1"`
+		Purpose uint32 `json:"purpose"`
+		Index   uint32 `json:"index"`
+		T       string `json:"t"`
+		Q       string `json:"Q"`
+		Pk      string `json:"pk"`
+		Sk      string `json:"sk"`
+		Cp1     string `json:"cp1"`
 	}
 	type specBranch struct {
 		SeedHex                string     `json:"seedHex"`
@@ -1493,7 +1534,7 @@ func TestSpecVectors(t *testing.T) {
 			t.Errorf("cx1 = %s, want %s", got, v.Cx1)
 		}
 		for _, note := range v.Notes {
-			pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, note.Index)
+			pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, note.Purpose, note.Index)
 			if err != nil {
 				t.Fatalf("#%d: %v", note.Index, err)
 			}
@@ -1503,7 +1544,7 @@ func TestSpecVectors(t *testing.T) {
 			if got := lnurlcash.EncodeCp1(pk); got != note.Cp1 {
 				t.Errorf("#%d: cp1 = %s, want %s", note.Index, got, note.Cp1)
 			}
-			sk, err := lnurlcash.DeriveNoteSecretKey(branch.PrivateKey, branch.ChainCode, note.Index)
+			sk, err := lnurlcash.DeriveNoteSecretKey(branch.PrivateKey, branch.ChainCode, note.Purpose, note.Index)
 			if err != nil {
 				t.Fatalf("#%d: %v", note.Index, err)
 			}
@@ -1521,7 +1562,7 @@ func TestSpecVectors(t *testing.T) {
 	t.Run("vector1", func(t *testing.T) { branchOf(t, vectors.Vector1) })
 	t.Run("vector2", func(t *testing.T) {
 		branch := branchOf(t, vectors.Vector2)
-		sk0, err := lnurlcash.DeriveNoteSecretKey(branch.PrivateKey, branch.ChainCode, 0)
+		sk0, err := lnurlcash.DeriveNoteSecretKey(branch.PrivateKey, branch.ChainCode, lnurlcash.NotePurposeWallet, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1767,11 +1808,14 @@ func TestLnurlWalletCheckVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, 0)
+	pk, err := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, lnurlcash.NotePurposeWallet, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := hex.EncodeToString(pk[:]); got != "6fb7c0137fc17fccb337947b361580b7686219f2eeab9d47ed52a49191d5136c" {
+	if got := hex.EncodeToString(pk[:]); got != "be5f31ff0b2bc0329961bcb08722b3033ab77a8bb35c776236a15d35afd911ab" {
+		// lnurl-wallet's own value for this branch and chain code is the
+		// pre-purpose 6fb7c013...; this one is recomputed independently for
+		// purpose 0, index 0 (LUD-25 at 50d740a)
 		t.Errorf("index-0 note pubkey = %s", got)
 	}
 }

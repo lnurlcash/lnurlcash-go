@@ -215,7 +215,7 @@ func VerifyNoteSignatureForKey(outputKeyHex string, amountMsat int64, signature,
 }
 
 // VerifyNoteURL makes LUD-25's offline check on a note URL as a recipient
-// holds it, lnurlw://mint.example/w?k1=<spend>&sig=<cs1>: the spend from k1,
+// holds it, lnurlw://mint.example/w?k1=<spend>&c=<cs1>: the spend from k1,
 // the domain from the URL's own host, and the amount from the cs1, or from the
 // URL's amount when the certificate is an older one that carries none. It
 // returns that amount with the verdict. A certificate proves issuance, never

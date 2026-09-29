@@ -34,7 +34,7 @@ func NoteDeclaredAmountMsat(rawURL string) (int64, bool) {
 	}
 	raw := parsed.Query().Get("amount")
 	if raw == "" {
-		certificate, err := DecodeCs1WithAmount(parsed.Query().Get("sig"))
+		certificate, err := DecodeCs1WithAmount(noteCertificate(parsed))
 		if err != nil {
 			return 0, false
 		}
@@ -53,7 +53,17 @@ func NoteSignature(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	return parsed.Query().Get("sig")
+	return noteCertificate(parsed)
+}
+
+// noteCertificate reads a note URL's certificate: c, or the sig a note from
+// before LUD-25 50d740a carries. New URLs are always written with c.
+func noteCertificate(parsed *url.URL) string {
+	query := parsed.Query()
+	if value := query.Get("c"); value != "" {
+		return value
+	}
+	return query.Get("sig")
 }
 
 // ResolveNoteInput resolves input to a note URL, or "" if it is not one.
@@ -108,7 +118,7 @@ func BuildNoteURL(withdrawLink, k1 string, amountMsat int64) string {
 // the wire, which is what a restore walk needs, since a walk queries a whole
 // gap window of indices the wallet has not minted into yet.
 //
-// k1, amount and sig are dropped: naming the note twice, once in a form that
+// k1, amount and the certificate are dropped: naming the note twice, once in a form that
 // spends it, would defeat the point.
 //
 // An unknown note is answered exactly as an unknown k1 is, and a burned note
@@ -133,7 +143,8 @@ func BuildNoteInfoURLByHash(withdrawLink, h string) string {
 	query := parsed.Query()
 	query.Del("k1")
 	query.Del("amount")
-	query.Del("sig")
+	query.Del("c")
+	query.Del("sig") // legacy name of c
 	// -1, not 0: encodeOrdered writes any amount >= 0, and a lookup that
 	// promises to drop amount must not add amount=0 back
 	ordered := encodeOrdered(query, [][2]string{{key, value}}, -1, "")
@@ -146,7 +157,7 @@ func BuildNoteInfoURLByHash(withdrawLink, h string) string {
 //
 // A signature only carries over when the response actually returned a fresh
 // one: a mutation at a service without offline verification drops any stale
-// sig, since it no longer matches the new secret.
+// certificate, since it no longer matches the new secret.
 func WithNewK1(rawURL, k1 string, amountMsat int64, signature string) string {
 	return rewriteNote(rawURL, strings.ToLower(k1), amountMsat, signature, false)
 }
@@ -183,9 +194,9 @@ func rewriteNote(rawURL, k1 string, amountMsat int64, signature string, drop boo
 				out = append(out, [2]string{"amount", strconv.FormatInt(amountMsat, 10)})
 				sawAmount = true
 			}
-		case "sig":
-			if signature != "" {
-				out = append(out, [2]string{"sig", signature})
+		case "c", "sig": // sig is the legacy name; it is rewritten as c
+			if signature != "" && !sawSig {
+				out = append(out, [2]string{"c", signature})
 				sawSig = true
 			}
 		default:
@@ -199,7 +210,7 @@ func rewriteNote(rawURL, k1 string, amountMsat int64, signature string, drop boo
 		out = append(out, [2]string{"amount", strconv.FormatInt(amountMsat, 10)})
 	}
 	if signature != "" && !sawSig {
-		out = append(out, [2]string{"sig", signature})
+		out = append(out, [2]string{"c", signature})
 	}
 	parsed.RawQuery = encodePairs(out)
 	return parsed.String()
@@ -254,7 +265,7 @@ func encodeOrdered(existing url.Values, prepend [][2]string, amountMsat int64, s
 		pairs = append(pairs, [2]string{"amount", strconv.FormatInt(amountMsat, 10)})
 	}
 	if signature != "" {
-		pairs = append(pairs, [2]string{"sig", signature})
+		pairs = append(pairs, [2]string{"c", signature})
 	}
 	return encodePairs(pairs)
 }

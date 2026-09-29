@@ -113,7 +113,7 @@ func (m *mockMint) credit(t *testing.T, k1 string, amountMsat int64) string {
 	if body["status"] != "OK" {
 		t.Fatalf("credit failed: %v", body)
 	}
-	signature, _ := body["sig"].(string)
+	signature, _ := body["c"].(string)
 	return signature
 }
 

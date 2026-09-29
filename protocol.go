@@ -108,7 +108,7 @@ type WithdrawInfo struct {
 	// A conforming service always publishes it here. Only ever empty, or not
 	// a compressed key, when the caller's Policy set AllowMissingMintPubkey.
 	MintPubkey string
-	// Signature is the service's certificate for the queried note, its sig: a
+	// Signature is the service's certificate for the queried note, its c: a
 	// cs1 over hex(Q) and the note's value, or empty when it gave none. Passed
 	// through as sent; VerifyNoteSignature is the check.
 	Signature string
@@ -211,12 +211,12 @@ type InvoiceStatus struct {
 
 // Mutation is a mutating callback's answer.
 type Mutation struct {
-	// Signature is sig, the cs1 certificate over the output's hex(Q). For an
+	// Signature is c, the cs1 certificate over the output's hex(Q). For an
 	// output named by cp1 it is never empty: ParseMutation refuses the answer
 	// without it. For one named by a bearer note's hex h it is empty only when
 	// the Policy admits a mint with no signer.
 	Signature string
-	// ChangeSignature is sig2, the same for a split's change.
+	// ChangeSignature is c2, the same for a split's change.
 	ChangeSignature string
 	// PR and VerifyURL form the optional LUD-25 melt proof.
 	PR        string
@@ -266,6 +266,15 @@ func rejectError(body map[string]any) error {
 		return &ServiceError{Reason: reason}
 	}
 	return nil
+}
+
+// certificate reads a certificate under its current name, falling back to the
+// legacy one a service from before LUD-25 50d740a still sends (sig, sig2).
+func certificate(body map[string]any, key, legacy string) string {
+	if value := str(body, key); value != "" {
+		return value
+	}
+	return str(body, legacy)
 }
 
 func str(body map[string]any, key string) string {
@@ -328,7 +337,7 @@ func msat(body map[string]any, key string) (int64, bool) {
 // NoteInfoRequest builds the LUD-03 informational GET. It never burns, rotates
 // or alters the note.
 //
-// sig is stripped before the request: it is only meaningful to a holder
+// c (or the legacy sig) is stripped before the request: it is only meaningful to a holder
 // inspecting the note locally, since the service already knows what it signed.
 // k1 and amount are left as they are.
 func NoteInfoRequest(noteURL string) (Request, error) {
@@ -339,7 +348,8 @@ func NoteInfoRequest(noteURL string) (Request, error) {
 	pairs := parseOrdered(parsed.RawQuery)
 	kept := pairs[:0]
 	for _, pair := range pairs {
-		if pair[0] != "sig" {
+		// c is the certificate; sig is the legacy name of it
+		if pair[0] != "c" && pair[0] != "sig" {
 			kept = append(kept, pair)
 		}
 	}
@@ -401,7 +411,7 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 		MinWithdrawableMsat: minimum,
 		DefaultDescription:  str(parsed, "defaultDescription"),
 		MintPubkey:          strings.ToLower(strings.TrimSpace(mintPubkey)),
-		Signature:           str(parsed, "sig"),
+		Signature:           certificate(parsed, "c", "sig"),
 	}, nil
 }
 
@@ -471,7 +481,7 @@ func ParseNoteInfoByHash(body []byte, policy Policy) (WithdrawInfo, error) {
 		MinWithdrawableMsat: minimum,
 		DefaultDescription:  str(parsed, "defaultDescription"),
 		MintPubkey:          strings.ToLower(strings.TrimSpace(mintPubkey)),
-		Signature:           str(parsed, "sig"),
+		Signature:           certificate(parsed, "c", "sig"),
 	}, nil
 }
 
@@ -721,7 +731,7 @@ func ParseMutation(body []byte, request Request, kind MutationKind, policy Polic
 			NewSecrets: newSecrets,
 		}
 	}
-	signature, changeSignature := str(parsed, "sig"), str(parsed, "sig2")
+	signature, changeSignature := certificate(parsed, "c", "sig"), certificate(parsed, "c2", "sig2")
 	if err := unsignedOutput(request, kind, policy, signature, changeSignature); err != nil {
 		return Mutation{}, err
 	}

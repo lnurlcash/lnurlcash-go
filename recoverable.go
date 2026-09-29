@@ -344,7 +344,7 @@ func IsCx1(value string) bool {
 
 // ---- the per-note key tweak ----
 //
-//	t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(i))
+//	t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(purpose) || ser32_be(i)) mod n
 //	pk_i = x(lift_x(P) + t*G)
 //	sk_i = ((P has even y ? p : n - p) + t) mod n
 //
@@ -354,10 +354,28 @@ func IsCx1(value string) bool {
 // The four-byte big-endian width is what lnurl-wallet and lnurl-mint both use;
 // the spec text does not pin it.
 //
+// purpose splits a branch into three independent counters, so a wallet's own
+// indices and a service's auto-minted ones never collide by coincidence, and
+// each kind of note can be scanned for and restored on its own. i counts per
+// purpose, per service.
+//
 // t is reduced mod n, as the spec requires and lnurl-wallet does (lnurl-mint
 // refuses t >= n instead; at ~2^-128 the two never meet). What is refused is a
 // note key at infinity or zero: the index is reported unusable and the caller
 // moves to the next.
+
+// The derivation purposes of LUD-25's Seed & derivation section.
+const (
+	// NotePurposeWallet is every note the wallet itself mints, rotates or
+	// merges into, and a split's resulting note (p1). It is also the purpose
+	// of the index-0 key that proves a Lightning Address registration.
+	NotePurposeWallet uint32 = 0
+	// NotePurposeChange is a split's change note (p2).
+	NotePurposeChange uint32 = 1
+	// NotePurposeLightningAddress is a note credited by Lightning Address
+	// auto-mint or an internal transfer, whichever rail delivered it.
+	NotePurposeLightningAddress uint32 = 2
+)
 
 var noteDeriveTag = sha256.Sum256([]byte("LNURLcash/derive"))
 
@@ -365,9 +383,10 @@ func unusableIndex(index uint32) error {
 	return &ProtocolError{Detail: fmt.Sprintf("note index %d is unusable on this branch - use the next index", index)}
 }
 
-func noteTweak(pubkeyXOnly, chainCode [32]byte, index uint32) (secp256k1.ModNScalar, error) {
-	var ser [4]byte
-	binary.BigEndian.PutUint32(ser[:], index)
+func noteTweak(pubkeyXOnly, chainCode [32]byte, purpose, index uint32) (secp256k1.ModNScalar, error) {
+	var ser [8]byte
+	binary.BigEndian.PutUint32(ser[:4], purpose)
+	binary.BigEndian.PutUint32(ser[4:], index)
 	h := sha256.New()
 	for _, part := range [][]byte{noteDeriveTag[:], noteDeriveTag[:], pubkeyXOnly[:], chainCode[:], ser[:]} {
 		h.Write(part)
@@ -380,12 +399,13 @@ func noteTweak(pubkeyXOnly, chainCode [32]byte, index uint32) (secp256k1.ModNSca
 	return t, nil
 }
 
-// DeriveNotePubkey returns the i-th note key on a branch, x-only, from the
+// DeriveNotePubkey returns the i-th note key on a branch for one purpose (the
+// NotePurpose constants), x-only, from the
 // branch's public half alone. It needs no private key, which is what lets a
 // service holding a registered cx1 mint straight to the holder's next key.
-func DeriveNotePubkey(branchPubkeyXOnly, chainCode [32]byte, index uint32) ([32]byte, error) {
+func DeriveNotePubkey(branchPubkeyXOnly, chainCode [32]byte, purpose, index uint32) ([32]byte, error) {
 	var out [32]byte
-	t, err := noteTweak(branchPubkeyXOnly, chainCode, index)
+	t, err := noteTweak(branchPubkeyXOnly, chainCode, purpose, index)
 	if err != nil {
 		return out, err
 	}
@@ -406,13 +426,14 @@ func DeriveNotePubkey(branchPubkeyXOnly, chainCode [32]byte, index uint32) ([32]
 	return out, nil
 }
 
-// DeriveNoteSecretKey is the holder's half: the i-th note's secret key.
+// DeriveNoteSecretKey is the holder's half: the i-th note's secret key on a
+// purpose.
 //
 // The branch key's own point may have odd y, and a cx1 carries only x, which
 // names the even-y point. So an odd branch key is negated first, or its note
 // keys would not be the ones a watcher derives - and a note a service minted
 // from the cx1 would sit under a key nobody holds.
-func DeriveNoteSecretKey(branchPrivateKey, chainCode [32]byte, index uint32) ([32]byte, error) {
+func DeriveNoteSecretKey(branchPrivateKey, chainCode [32]byte, purpose, index uint32) ([32]byte, error) {
 	var p secp256k1.ModNScalar
 	if p.SetBytes(&branchPrivateKey) != 0 || p.IsZero() {
 		return [32]byte{}, &ProtocolError{Detail: "a branch private key is a 32-byte scalar in [1, n)"}
@@ -420,7 +441,7 @@ func DeriveNoteSecretKey(branchPrivateKey, chainCode [32]byte, index uint32) ([3
 	compressed := secp256k1.NewPrivateKey(&p).PubKey().SerializeCompressed()
 	var branchX [32]byte
 	copy(branchX[:], compressed[1:])
-	t, err := noteTweak(branchX, chainCode, index)
+	t, err := noteTweak(branchX, chainCode, purpose, index)
 	if err != nil {
 		return [32]byte{}, err
 	}
