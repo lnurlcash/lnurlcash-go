@@ -1,13 +1,17 @@
 package lnurlcash
 
-// LUD-25's m/139' branch derivation: the BIP-32 walk from a wallet's cash root
-// down to a per-service domain node, exactly as its "Seed & derivation"
+// LUD-26's m/139' service-root derivation: the BIP-32 walk from a wallet's cash
+// root down to a per-service root S, exactly as its "Seed & derivation"
 // section specifies it:
 //
 //	cashHashingKey   = derive(masterKey, m/139'/0)
 //	domainMaterial   = hmacSha256(cashHashingKey, full SERVICE domain)
 //	(d1, d2, d3, d4) = first 16 bytes of domainMaterial as 4 uint32
-//	domainNode       = derive(masterKey, m/139'/d1/d2/d3/d4)
+//	S                = derive(masterKey, m/139'/d1/d2/d3/d4)
+//
+// domain is the string LUD-25's canonical spend transaction commits to: the
+// mint's lowercase hostname, never its port (see DeriveServiceRoot). Everything
+// below S is plain BIP-32 too, laid out in recoverable.go.
 //
 // "exactly as LUD-05", says the draft of the middle two lines, and that
 // reference settles the one thing the path shape leaves open. d1..d4 are raw
@@ -30,8 +34,10 @@ package lnurlcash
 // still derived and still scanned on restore, so nothing already minted under
 // it goes missing.
 //
-// The key-path notes' address branch is this exact domain node, for the same
-// host: see DeriveCashAddressNode.
+// DeriveCashDomainNode is the same walk over the host exactly as the wallet
+// stored it, port included. That is the node the superseded tweak schemes hung
+// their notes off, kept so a wallet can still sweep them (see
+// LegacyBranchNode).
 
 import (
 	"crypto/hmac"
@@ -172,16 +178,13 @@ func CashDomainIndices(root CashNode, host string) ([4]uint32, error) {
 	return out, nil
 }
 
-// DeriveCashDomainNode returns m/139'/d1/d2/d3/d4 for one mint: the address
-// branch of its key-path notes, which DeriveCashAddressNode returns too.
+// DeriveCashDomainNode returns m/139'/d1/d2/d3/d4 over host exactly as given,
+// port included: the node the superseded tweak schemes derived their notes
+// from. LUD-26's root is DeriveServiceRoot, which hashes the domain without its
+// port; for a host without one the two are the same node.
 //
-// Whoever holds it can derive every note key the wallet will ever hold AT THIS
-// MINT, so it is provisioning material rather than something to hand out: one
-// mint's subtree, not the wallet. Hand out CashNodeToCx1 of it instead.
-//
-// host is the mint host exactly as the wallet stores it - lowercase, port
-// included where there is one - which is what the reference wallet passes, so
-// the two derive the same tree.
+// Whoever derives it can derive every note key the wallet held under those
+// schemes AT THIS MINT, so it is bearer material for one mint's subtree.
 func DeriveCashDomainNode(root CashNode, host string) (CashNode, error) {
 	indices, err := CashDomainIndices(root, host)
 	if err != nil {
@@ -194,6 +197,76 @@ func DeriveCashDomainNode(root CashNode, host string) (CashNode, error) {
 		}
 	}
 	return node, nil
+}
+
+// DeriveServiceRoot returns S = m/139'/d1/d2/d3/d4, one SERVICE's LUD-26 root,
+// from the wallet's m/139' root (DeriveCashRoot).
+//
+// domain may be a mint URL, a note URL or a bare host: it is reduced to the
+// lowercase hostname without scheme or port, the same string every signature at
+// that mint commits to (see SpendDomainOf). A domain hosts exactly one mint, so
+// seed plus domain recovers everything a wallet holds there.
+//
+// Bearer material for every note the wallet will ever hold at this mint: a
+// wallet hands out a share's cx1, never this node.
+func DeriveServiceRoot(root CashNode, domain string) (CashNode, error) {
+	host, err := SpendDomainOf(domain)
+	if err != nil {
+		return CashNode{}, &ProtocolError{Detail: "a SERVICE root is derived for a domain"}
+	}
+	return DeriveCashDomainNode(root, host)
+}
+
+// CashNodePublicKey returns a node's compressed public key, P in BIP-32's
+// terms.
+func CashNodePublicKey(node CashNode) ([33]byte, error) {
+	var out [33]byte
+	var key secp256k1.ModNScalar
+	if key.SetBytes(&node.PrivateKey) != 0 || key.IsZero() {
+		return out, &ProtocolError{Detail: "cash node holds an invalid private key"}
+	}
+	copy(out[:], secp256k1.NewPrivateKey(&key).PubKey().SerializeCompressed())
+	return out, nil
+}
+
+// DeriveCashChildPub performs one BIP-32 CKDpub step from a compressed public
+// key and its chain code: what a SERVICE holding only a share's cx1 derives
+// each of its notes with. A hardened index is refused, since only the private
+// key can take one. Returns the child's compressed key and chain code.
+func DeriveCashChildPub(pubkey [33]byte, chainCode [32]byte, index uint32) ([33]byte, [32]byte, error) {
+	var outKey [33]byte
+	var outChain [32]byte
+	if index >= hardened {
+		return outKey, outChain, &ProtocolError{Detail: fmt.Sprintf("a public key has no hardened child, and %d is one", index)}
+	}
+	parent, err := secp256k1.ParsePubKey(pubkey[:])
+	if err != nil {
+		return outKey, outChain, &ProtocolError{Detail: "not a compressed secp256k1 point"}
+	}
+	data := make([]byte, 37)
+	copy(data[:33], pubkey[:])
+	binary.BigEndian.PutUint32(data[33:], index)
+	material := hmac512(chainCode[:], data)
+
+	// the same two ~2^-127 failures as CKDpriv: a tweak at or above the group
+	// order, and a child at infinity
+	var il [32]byte
+	copy(il[:], material[:32])
+	var tweak secp256k1.ModNScalar
+	if tweak.SetBytes(&il) != 0 {
+		return outKey, outChain, &ProtocolError{Detail: fmt.Sprintf("BIP-32 derivation at %d is out of range", index)}
+	}
+	var point, tweakPoint, child secp256k1.JacobianPoint
+	parent.AsJacobian(&point)
+	secp256k1.ScalarBaseMultNonConst(&tweak, &tweakPoint)
+	secp256k1.AddNonConst(&point, &tweakPoint, &child)
+	if (child.X.IsZero() && child.Y.IsZero()) || child.Z.IsZero() {
+		return outKey, outChain, &ProtocolError{Detail: fmt.Sprintf("BIP-32 derivation at %d is out of range", index)}
+	}
+	child.ToAffine()
+	copy(outKey[:], secp256k1.NewPublicKey(&child.X, &child.Y).SerializeCompressed())
+	copy(outChain[:], material[32:])
+	return outKey, outChain, nil
 }
 
 // CashNodeToHex renders a node as privateKey || chainCode, 64 bytes of hex.

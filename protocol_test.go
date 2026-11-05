@@ -260,7 +260,11 @@ func TestAcceptsTheOtherRecoveryIDLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-	if got := lnurlcash.VerifyNoteSignature(rotated.K1, mint.url, 21000, rotated.Signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+	// A mint from before luds 92abbb3 forwarded its node's signmessage output
+	// unreordered, over the message without a domain. Notes people hold carry
+	// such certificates, so they still verify, as legacy; a current certificate
+	// is only ever r || s || recovery_id.
+	if got := lnurlcash.VerifyNoteSignature(rotated.K1, mint.url, 21000, rotated.Signature, mint.pubkey); got != lnurlcash.CertifiedOverLegacyQ {
 		t.Fatalf("a recovery-id-leading certificate = %v", got)
 	}
 }
@@ -891,7 +895,7 @@ func TestALyingServiceCannotInflatePastWhatItSigned(t *testing.T) {
 	if got := lnurlcash.VerifyNoteSignature(k1, mint.url, info.MaxWithdrawableMsat, signature, mint.pubkey); got != lnurlcash.NotCertified {
 		t.Fatalf("an inflated amount verified: %v", got)
 	}
-	if got := lnurlcash.VerifyNoteSignature(k1, mint.url, 21000, signature, mint.pubkey); got != lnurlcash.CertifiedOverQ {
+	if got := lnurlcash.VerifyNoteSignature(k1, mint.url, 21000, signature, mint.pubkey); !got.Verified() {
 		t.Fatalf("the true amount = %v", got)
 	}
 	// and the certificate the lookup hands out says the same
@@ -1167,26 +1171,31 @@ func TestAnOutputAlreadyInUseIsRefusedAndBurnsNothing(t *testing.T) {
 	mint.credit(t, taken, 1000)
 	takenH, _ := lnurlcash.HashK1(taken)
 
+	// LUD-25 answers a taken output and a burned input alike, exactly "already
+	// in use", and from the wording alone the two are one: it is read as a
+	// spent input, so the fresh secrets of a mutation that may have applied stay
+	// attached. A caller that named its own output tells them apart by its
+	// inputs, which is the check below.
 	_, err := client.RotateNoteWithHash(ctx(t), mint.callback(), input, takenH)
-	if !errors.Is(err, lnurlcash.ErrOutputInUse) {
+	if !lnurlcash.IsAlreadyInUse(err) || lnurlcash.IsAmbiguous(err) {
 		t.Fatalf("rotating into a live note = %v, want already in use", err)
 	}
-	if lnurlcash.IsSpent(err) || lnurlcash.IsAmbiguous(err) || len(lnurlcash.NewSecrets(err)) != 0 {
-		t.Errorf("already in use read as something that may have burned: %v", err)
+	if !lnurlcash.IsSpent(err) || errors.Is(err, lnurlcash.ErrOutputInUse) {
+		t.Errorf("the exact LUD-25 reason is not read as a spent note: %v", err)
 	}
 	if state := mint.noteState(t, input); state != "outstanding" {
 		t.Fatalf("the input is %s after a refused rotate", state)
 	}
 	// the same output named by its cp1 is the same note, and just as taken
 	takenQ, _ := lnurlcash.BearerNoteID(takenH)
-	if _, err := client.RotateNoteWithHash(ctx(t), mint.callback(), input, lnurlcash.EncodeCp1(hex32(t, takenQ))); !errors.Is(err, lnurlcash.ErrOutputInUse) {
+	if _, err := client.RotateNoteWithHash(ctx(t), mint.callback(), input, lnurlcash.EncodeCp1(hex32(t, takenQ))); !lnurlcash.IsAlreadyInUse(err) {
 		t.Fatalf("rotating into a live note's cp1 = %v, want already in use", err)
 	}
 }
 
 // lnurl-mint words the refusal "Output already in use." rather than the
-// spec's exact "already in use"; a wallet retrying at its next index must
-// recognise both.
+// spec's exact "already in use". That wording names the output, so it stays
+// an output refusal, and IsAlreadyInUse recognises it beside the exact reason.
 func TestLnurlMintsWordingOfAlreadyInUse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1195,7 +1204,7 @@ func TestLnurlMintsWordingOfAlreadyInUse(t *testing.T) {
 	t.Cleanup(server.Close)
 	takenH, _ := lnurlcash.HashK1(secret(33))
 	_, err := lnurlcash.NewClient().RotateNoteWithHash(ctx(t), server.URL+"/w/cb", secret(32), takenH)
-	if !errors.Is(err, lnurlcash.ErrOutputInUse) {
-		t.Fatalf("lnurl-mint's refusal = %v, want already in use", err)
+	if !errors.Is(err, lnurlcash.ErrOutputInUse) || !lnurlcash.IsAlreadyInUse(err) || lnurlcash.IsSpent(err) {
+		t.Fatalf("lnurl-mint's refusal = %v, want an output already in use", err)
 	}
 }

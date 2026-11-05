@@ -535,6 +535,60 @@ func ParseMintAddress(body []byte) (MintAddress, error) {
 	}, nil
 }
 
+// ---- LUD-26's internal transfer ----
+
+// InternalTransferRequest pays a Lightning Address at the note's own mint with
+// the note itself, by sending its spend to the address's payRequest callback
+// instead of asking for an invoice. The service burns the note and credits its
+// full value, free of fees, to the payee's next share key, which the payer
+// never learns.
+//
+// amountMsat MUST be the note's full value (maxWithdrawable from its
+// informational GET), within the payRequest's sendable range: to pay part of a
+// note, split off the exact amount first.
+//
+// Refused, before anything is sent, unless the payRequest's WithdrawLink is on
+// noteDomain (the note URL, or the mint it lives at). Anywhere else this hands
+// a bearer secret to a service that does not hold the note.
+func InternalTransferRequest(payRequest PayRequest, noteDomain, k1 string, amountMsat int64) (Request, error) {
+	payee, payeeErr := SpendDomainOf(payRequest.WithdrawLink)
+	note, noteErr := SpendDomainOf(noteDomain)
+	if payRequest.WithdrawLink == "" || payeeErr != nil || noteErr != nil || payee != note {
+		return Request{}, fmt.Errorf("%w: that Lightning Address is not at the note's mint, so the note cannot be sent to it - pay it over Lightning instead", ErrRequestRefused)
+	}
+	if amountMsat < payRequest.MinSendableMsat || amountMsat > payRequest.MaxSendableMsat {
+		return Request{}, fmt.Errorf("%w: %d msat is outside what that address accepts - split the note first", ErrRequestRefused, amountMsat)
+	}
+	k1 = strings.TrimSpace(k1)
+	if _, err := DecodeSpend(strings.ToLower(k1)); err != nil {
+		return Request{}, fmt.Errorf("%w: that k1 is no spend", ErrRequestRefused)
+	}
+	built, err := callbackURL(payRequest.Callback, [][2]string{{"amount", strconv.FormatInt(amountMsat, 10)}, {"k1", k1}})
+	if err != nil {
+		return Request{}, err
+	}
+	return Request{URL: built}, nil
+}
+
+// ParseInternalTransfer reads the answer to an InternalTransferRequest. Anything
+// but a clear OK or a clear refusal is ambiguous: the note may already be
+// burned.
+func ParseInternalTransfer(body []byte) error {
+	parsed, err := decode(body)
+	if err != nil {
+		return err
+	}
+	if err := rejectError(parsed); err != nil {
+		var service *ServiceError
+		_ = asService(err, &service)
+		return classifyNoteError(service.Reason)
+	}
+	if str(parsed, "status") != "OK" {
+		return &AmbiguousError{Detail: "the service did not confirm the transfer - the note may already be spent"}
+	}
+	return nil
+}
+
 // ---- the mutating callback ----
 
 func callbackURL(callback string, params [][2]string) (string, error) {

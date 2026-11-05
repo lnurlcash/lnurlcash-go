@@ -10,9 +10,11 @@ package lnurlcash
 // issuance offline with nothing but the spend, the cs1 and the note URL's
 // domain.
 //
-// A watch-only cx1 - a branch's x-only key and its chain code - lets whoever
-// holds it derive every note key on the branch, which is how a service mints
-// straight to a holder's next key, but spend none of them.
+// A watch-only cx1 - a share's compressed key and its chain code, an xpub in
+// BIP-32's order - lets whoever holds it derive every note key on the share with
+// CKDpub, which is how a service mints straight to a holder's next key, but
+// spend none of them. Below a service's root S, every key is plain BIP-32
+// (LUD-26).
 //
 // The names follow lnurl-wallet's src/lib.
 
@@ -283,6 +285,10 @@ func DecodeCs1WithAmount(value string) (Cs1, error) {
 	if len(payload) != len(out.Signature) {
 		return out, invalid(fmt.Sprintf("the payload is %d bytes, not %d", len(payload), len(out.Signature)))
 	}
+	// LUD-25 has a SERVICE refuse a recovery id above 3
+	if payload[64] > 3 {
+		return out, invalid("the recovery id is above 3")
+	}
 	out.AmountMsat = amount
 	copy(out.Signature[:], payload)
 	return out, nil
@@ -308,31 +314,46 @@ func IsAnyCs1(value string) bool {
 	return err == nil
 }
 
-// Cx1 is a watch-only branch export: the branch's x-only public key and its
-// chain code. Anyone holding one can enumerate every note key on the branch,
-// and link them, but cannot spend any.
+// Cx1 is a share's extended public key (LUD-26): its chain code and compressed
+// point, in BIP-32's order. Whoever holds one can derive every note key on the
+// share with DeriveNotePubkey, and link them all to each other, but cannot
+// spend any.
 type Cx1 struct {
-	PubkeyXOnly [32]byte
-	ChainCode   [32]byte
+	ChainCode [32]byte
+	// Pubkey is compressed, 02 or 03 first.
+	Pubkey [33]byte
 }
 
-// EncodeCx1 encodes a branch's x-only key and chain code.
-func EncodeCx1(pubkeyXOnly, chainCode [32]byte) string {
-	var payload [64]byte
-	copy(payload[:32], pubkeyXOnly[:])
-	copy(payload[32:], chainCode[:])
+// PubkeyXOnly returns x(P): what a registration proof by this share verifies
+// against.
+func (c Cx1) PubkeyXOnly() [32]byte {
+	var x [32]byte
+	copy(x[:], c.Pubkey[1:])
+	return x
+}
+
+// EncodeCx1 encodes bech32m("cx", chainCode || P), 113 characters.
+func EncodeCx1(cx1 Cx1) string {
+	var payload [65]byte
+	copy(payload[:32], cx1.ChainCode[:])
+	copy(payload[32:], cx1.Pubkey[:])
 	return encodeFixed("cx", payload[:])
 }
 
-// DecodeCx1 reads a cx1 back to its two halves.
+// DecodeCx1 reads a cx1 back to its two halves. A payload that is not 65 bytes
+// is refused, as is a key that is not a compressed curve point: the superseded
+// 64-byte shape is DecodeLegacyCx1's, and no SERVICE registers one any more.
 func DecodeCx1(value string) (Cx1, error) {
 	var out Cx1
-	payload, err := decodeFixed("cx", value, 64)
+	payload, err := decodeFixed("cx", value, 65)
 	if err != nil {
 		return out, err
 	}
-	copy(out.PubkeyXOnly[:], payload[:32])
-	copy(out.ChainCode[:], payload[32:])
+	copy(out.ChainCode[:], payload[:32])
+	copy(out.Pubkey[:], payload[32:])
+	if _, err := secp256k1.ParsePubKey(out.Pubkey[:]); err != nil {
+		return Cx1{}, &ProtocolError{Detail: "not a cx1: its key is not a compressed point on the curve"}
+	}
 	return out, nil
 }
 
@@ -342,40 +363,242 @@ func IsCx1(value string) bool {
 	return err == nil
 }
 
-// ---- the per-note key tweak ----
+// ---- LUD-26: notes below a SERVICE's root ----
 //
-//	t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(purpose) || ser32_be(i)) mod n
+//	S            = m/139'/d1/d2/d3/d4      see DeriveServiceRoot
+//	S/a'/0/i     wallet: every note the wallet mints, rotates or merges into, and a split's p1
+//	S/a'/1/i     change: a split's p2
+//	S/a'/2/n'    share n, handed out as its cx1
+//	S/a'/2/n'/i  note i of share n, picked and credited by the SERVICE
+//
+// Plain BIP-32 all the way down: a note's secret key is the private key at its
+// path and its Q is x(sk*G), so any BIP-32 library derives the same tree, and a
+// SERVICE holding a share's cx1 derives that share's notes with CKDpub alone.
+// Accounts and shares are hardened, so no account's or share's keys can be
+// derived from another's; note indices are not, and are below 2^31.
+
+const (
+	// ChainWallet is every note the wallet mints, rotates or merges into, and
+	// a split's p1.
+	ChainWallet uint32 = 0
+	// ChainChange is a split's change p2.
+	ChainChange uint32 = 1
+	// ChainShare holds the shares, each exported as a cx1.
+	ChainShare uint32 = 2
+)
+
+// NotePath is where a note sits below a SERVICE's root. Build one with
+// WalletNotePath, ChangeNotePath or ShareNotePath.
+type NotePath struct {
+	// Chain is ChainWallet, ChainChange or ChainShare.
+	Chain   uint32
+	Account uint32
+	// Share is the share's number, used only on ChainShare.
+	Share uint32
+	Index uint32
+}
+
+// WalletNotePath is S/account'/0/index.
+func WalletNotePath(account, index uint32) NotePath {
+	return NotePath{Chain: ChainWallet, Account: account, Index: index}
+}
+
+// ChangeNotePath is S/account'/1/index.
+func ChangeNotePath(account, index uint32) NotePath {
+	return NotePath{Chain: ChainChange, Account: account, Index: index}
+}
+
+// ShareNotePath is S/account'/2/share'/index. Only a SERVICE picks these
+// indices; a wallet never names one as a resulting note itself.
+func ShareNotePath(account, share, index uint32) NotePath {
+	return NotePath{Chain: ChainShare, Account: account, Share: share, Index: index}
+}
+
+func belowHardened(value uint32, what string) (uint32, error) {
+	if value >= hardened {
+		return 0, &ProtocolError{Detail: fmt.Sprintf("%s %d is not below 2^31", what, value)}
+	}
+	return value, nil
+}
+
+// Indices returns the BIP-32 indices below S, hardened ones included.
+func (p NotePath) Indices() ([]uint32, error) {
+	account, err := belowHardened(p.Account, "an account")
+	if err != nil {
+		return nil, err
+	}
+	out := []uint32{account + hardened}
+	switch p.Chain {
+	case ChainWallet, ChainChange:
+		out = append(out, p.Chain)
+	case ChainShare:
+		share, err := belowHardened(p.Share, "a share")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ChainShare, share+hardened)
+	default:
+		return nil, &ProtocolError{Detail: fmt.Sprintf("%d is not a note chain", p.Chain)}
+	}
+	index, err := belowHardened(p.Index, "a note index")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, index), nil
+}
+
+// NoteKey is a note's keys. Bearer material: the secret key spends the note.
+type NoteKey struct {
+	SecretKey [32]byte
+	// Pubkey is compressed, so its y parity is visible: a BIP-340 signer
+	// negates the secret key when it is odd.
+	Pubkey [33]byte
+	// OutputKey is Q = x(Pubkey), the note itself.
+	OutputKey [32]byte
+}
+
+// DeriveNoteKey returns the note at path below serviceRoot (DeriveServiceRoot).
+func DeriveNoteKey(serviceRoot CashNode, path NotePath) (NoteKey, error) {
+	indices, err := path.Indices()
+	if err != nil {
+		return NoteKey{}, err
+	}
+	node := serviceRoot
+	for _, index := range indices {
+		if node, err = DeriveCashChild(node, index); err != nil {
+			return NoteKey{}, err
+		}
+	}
+	pubkey, err := CashNodePublicKey(node)
+	if err != nil {
+		return NoteKey{}, err
+	}
+	out := NoteKey{SecretKey: node.PrivateKey, Pubkey: pubkey}
+	copy(out.OutputKey[:], pubkey[1:])
+	return out, nil
+}
+
+// DeriveShareNode returns S/account'/2/share', the node behind a share's cx1.
+// Bearer material for every note on the share: hand out CashNodeToCx1 of it,
+// and sign its registration with its own key (SignAddressProof).
+func DeriveShareNode(serviceRoot CashNode, account, share uint32) (CashNode, error) {
+	account, err := belowHardened(account, "an account")
+	if err != nil {
+		return CashNode{}, err
+	}
+	share, err = belowHardened(share, "a share")
+	if err != nil {
+		return CashNode{}, err
+	}
+	node := serviceRoot
+	for _, index := range []uint32{account + hardened, ChainShare, share + hardened} {
+		if node, err = DeriveCashChild(node, index); err != nil {
+			return CashNode{}, err
+		}
+	}
+	return node, nil
+}
+
+// CashNodeToCx1 is the watch-only half of a share node: what a holder hands a
+// mint so the mint can pay to the holder's keys.
+func CashNodeToCx1(node CashNode) (Cx1, error) {
+	pubkey, err := CashNodePublicKey(node)
+	if err != nil {
+		return Cx1{}, err
+	}
+	return Cx1{ChainCode: node.ChainCode, Pubkey: pubkey}, nil
+}
+
+// DeriveNotePubkey returns Q of note index on the share cx1 exports: CKDpub, no
+// private key anywhere, which is what lets a SERVICE credit a registered
+// share's next note. A hardened index is refused, and an unusable one
+// (~2^-127) is an error: use the next.
+func DeriveNotePubkey(cx1 Cx1, index uint32) ([32]byte, error) {
+	var out [32]byte
+	pubkey, _, err := DeriveCashChildPub(cx1.Pubkey, cx1.ChainCode, index)
+	if err != nil {
+		return out, err
+	}
+	copy(out[:], pubkey[1:])
+	return out, nil
+}
+
+// ---- superseded: the per-note tweak ----
+//
+// Before LUD-26 (luds a6c4652), note keys were tweaked off one branch node,
+// m/139'/d1/d2/d3/d4 over the host as stored (port included), and a cx1 was the
+// 64-byte x(P) || chainCode:
+//
+//	t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32(purpose) || ser32(i)) mod n
 //	pk_i = x(lift_x(P) + t*G)
 //	sk_i = ((P has even y ? p : n - p) + t) mod n
 //
-// BIP-341's taproot tweak, so a watcher holding only a cx1 computes the same
-// pk_i the holder does. i is any uint32 and is never hardened: a watch-only
-// derivation cannot harden anything, which is the whole reason a cx1 works.
-// The four-byte big-endian width is what lnurl-wallet and lnurl-mint both use;
-// the spec text does not pin it.
-//
-// purpose splits a branch into three independent counters, so a wallet's own
-// indices and a service's auto-minted ones never collide by coincidence, and
-// each kind of note can be scanned for and restored on its own. i counts per
-// purpose, per service.
-//
-// t is reduced mod n, as the spec requires and lnurl-wallet does (lnurl-mint
-// refuses t >= n instead; at ~2^-128 the two never meet). What is refused is a
-// note key at infinity or zero: the index is reported unusable and the caller
-// moves to the next.
+// purpose 0 was the wallet's own notes, 1 a split's change and 2 the Lightning
+// Address rail (luds 50d740a); before purposes (luds 6e865b1) there was no
+// ser32(purpose) at all. Notes minted under either are still money, so a wallet
+// derives them here to find and sweep them into LUD-26 keys. Nothing new is
+// ever derived or registered this way.
 
-// The derivation purposes of LUD-25's Seed & derivation section.
+// LegacyPurpose is the superseded tweak's purpose counter.
+type LegacyPurpose int64
+
 const (
-	// NotePurposeWallet is every note the wallet itself mints, rotates or
-	// merges into, and a split's resulting note (p1). It is also the purpose
-	// of the index-0 key that proves a Lightning Address registration.
-	NotePurposeWallet uint32 = 0
-	// NotePurposeChange is a split's change note (p2).
-	NotePurposeChange uint32 = 1
-	// NotePurposeLightningAddress is a note credited by Lightning Address
-	// auto-mint or an internal transfer, whichever rail delivered it.
-	NotePurposeLightningAddress uint32 = 2
+	// LegacyPurposeNone is the scheme before purposes existed (luds
+	// 6e865b1): no purpose is hashed at all.
+	LegacyPurposeNone LegacyPurpose = -1
+	// LegacyPurposeWallet is the wallet's own notes.
+	LegacyPurposeWallet LegacyPurpose = 0
+	// LegacyPurposeChange is a split's change.
+	LegacyPurposeChange LegacyPurpose = 1
+	// LegacyPurposeLightningAddress is Lightning Address auto-mint and
+	// internal transfer.
+	LegacyPurposeLightningAddress LegacyPurpose = 2
 )
+
+// LegacyCx1 is a superseded 64-byte cx1, x(P) || chainCode.
+type LegacyCx1 struct {
+	PubkeyXOnly [32]byte
+	ChainCode   [32]byte
+}
+
+// EncodeLegacyCx1 encodes the superseded 64-byte shape.
+func EncodeLegacyCx1(cx1 LegacyCx1) string {
+	var payload [64]byte
+	copy(payload[:32], cx1.PubkeyXOnly[:])
+	copy(payload[32:], cx1.ChainCode[:])
+	return encodeFixed("cx", payload[:])
+}
+
+// DecodeLegacyCx1 reads the superseded 64-byte shape.
+func DecodeLegacyCx1(value string) (LegacyCx1, error) {
+	var out LegacyCx1
+	payload, err := decodeFixed("cx", value, 64)
+	if err != nil {
+		return out, err
+	}
+	copy(out.PubkeyXOnly[:], payload[:32])
+	copy(out.ChainCode[:], payload[32:])
+	return out, nil
+}
+
+// LegacyBranchNode returns the node the superseded schemes tweaked their notes
+// off: m/139'/d1/d2/d3/d4 for host exactly as the wallet stored it, port
+// included. Bearer material for every note it ever held there under them.
+func LegacyBranchNode(root CashNode, host string) (CashNode, error) {
+	return DeriveCashDomainNode(root, host)
+}
+
+// LegacyCx1Of returns the superseded watch-only half of a LegacyBranchNode.
+func LegacyCx1Of(node CashNode) (LegacyCx1, error) {
+	var out LegacyCx1
+	pubkey, err := CashNodePublicKey(node)
+	if err != nil {
+		return out, err
+	}
+	copy(out.PubkeyXOnly[:], pubkey[1:])
+	out.ChainCode = node.ChainCode
+	return out, nil
+}
 
 var noteDeriveTag = sha256.Sum256([]byte("LNURLcash/derive"))
 
@@ -383,12 +606,19 @@ func unusableIndex(index uint32) error {
 	return &ProtocolError{Detail: fmt.Sprintf("note index %d is unusable on this branch - use the next index", index)}
 }
 
-func noteTweak(pubkeyXOnly, chainCode [32]byte, purpose, index uint32) (secp256k1.ModNScalar, error) {
-	var ser [8]byte
-	binary.BigEndian.PutUint32(ser[:4], purpose)
-	binary.BigEndian.PutUint32(ser[4:], index)
+// legacyTweak is t reduced mod n, as the spec then required and lnurl-wallet
+// did (lnurl-mint refused t >= n instead; at ~2^-128 the two never meet).
+func legacyTweak(pubkeyXOnly, chainCode [32]byte, purpose LegacyPurpose, index uint32) (secp256k1.ModNScalar, error) {
+	if purpose < LegacyPurposeNone || purpose > 0xffffffff {
+		return secp256k1.ModNScalar{}, &ProtocolError{Detail: "not a legacy purpose"}
+	}
+	parts := [][]byte{noteDeriveTag[:], noteDeriveTag[:], pubkeyXOnly[:], chainCode[:]}
+	if purpose != LegacyPurposeNone {
+		parts = append(parts, binary.BigEndian.AppendUint32(nil, uint32(purpose)))
+	}
+	parts = append(parts, binary.BigEndian.AppendUint32(nil, index))
 	h := sha256.New()
-	for _, part := range [][]byte{noteDeriveTag[:], noteDeriveTag[:], pubkeyXOnly[:], chainCode[:], ser[:]} {
+	for _, part := range parts {
 		h.Write(part)
 	}
 	var digest [32]byte
@@ -399,18 +629,17 @@ func noteTweak(pubkeyXOnly, chainCode [32]byte, purpose, index uint32) (secp256k
 	return t, nil
 }
 
-// DeriveNotePubkey returns the i-th note key on a branch for one purpose (the
-// NotePurpose constants), x-only, from the
-// branch's public half alone. It needs no private key, which is what lets a
-// service holding a registered cx1 mint straight to the holder's next key.
-func DeriveNotePubkey(branchPubkeyXOnly, chainCode [32]byte, purpose, index uint32) ([32]byte, error) {
+// LegacyDeriveNotePubkey returns a note key under the superseded tweak, x-only,
+// from the legacy cx1 half alone. purpose is LegacyPurposeNone for the scheme
+// before purposes existed.
+func LegacyDeriveNotePubkey(cx1 LegacyCx1, purpose LegacyPurpose, index uint32) ([32]byte, error) {
 	var out [32]byte
-	t, err := noteTweak(branchPubkeyXOnly, chainCode, purpose, index)
+	t, err := legacyTweak(cx1.PubkeyXOnly, cx1.ChainCode, purpose, index)
 	if err != nil {
 		return out, err
 	}
 	// lift_x: the even-y point with this x, the only one a cx1 can name
-	branch, err := secp256k1.ParsePubKey(append([]byte{secp256k1.PubKeyFormatCompressedEven}, branchPubkeyXOnly[:]...))
+	branch, err := secp256k1.ParsePubKey(append([]byte{secp256k1.PubKeyFormatCompressedEven}, cx1.PubkeyXOnly[:]...))
 	if err != nil {
 		return out, &ProtocolError{Detail: "that branch key is not the x coordinate of a point on the curve"}
 	}
@@ -426,22 +655,21 @@ func DeriveNotePubkey(branchPubkeyXOnly, chainCode [32]byte, purpose, index uint
 	return out, nil
 }
 
-// DeriveNoteSecretKey is the holder's half: the i-th note's secret key on a
-// purpose.
+// LegacyDeriveNoteSecretKey is the secret key behind LegacyDeriveNotePubkey,
+// from a LegacyBranchNode.
 //
-// The branch key's own point may have odd y, and a cx1 carries only x, which
-// names the even-y point. So an odd branch key is negated first, or its note
-// keys would not be the ones a watcher derives - and a note a service minted
-// from the cx1 would sit under a key nobody holds.
-func DeriveNoteSecretKey(branchPrivateKey, chainCode [32]byte, purpose, index uint32) ([32]byte, error) {
+// The branch key's own point may have odd y, and a legacy cx1 carried only x,
+// which names the even-y point. So an odd branch key is negated first, or its
+// note keys would not be the ones a watcher derives.
+func LegacyDeriveNoteSecretKey(node CashNode, purpose LegacyPurpose, index uint32) ([32]byte, error) {
 	var p secp256k1.ModNScalar
-	if p.SetBytes(&branchPrivateKey) != 0 || p.IsZero() {
+	if p.SetBytes(&node.PrivateKey) != 0 || p.IsZero() {
 		return [32]byte{}, &ProtocolError{Detail: "a branch private key is a 32-byte scalar in [1, n)"}
 	}
 	compressed := secp256k1.NewPrivateKey(&p).PubKey().SerializeCompressed()
 	var branchX [32]byte
 	copy(branchX[:], compressed[1:])
-	t, err := noteTweak(branchX, chainCode, purpose, index)
+	t, err := legacyTweak(branchX, node.ChainCode, purpose, index)
 	if err != nil {
 		return [32]byte{}, err
 	}
@@ -653,35 +881,6 @@ func NoteLookupOf(k1 string) (string, error) {
 	return EncodeCp1(spend.OutputKey), nil
 }
 
-// ---- the address branch ----
-
-// DeriveCashAddressNode returns m/139'/d1/d2/d3/d4 for one mint - the literal
-// path LUD-25's text specifies, and the exact node DeriveCashDomainNode already
-// derives for any service. There is no separate purpose for key-path notes: an
-// earlier reference-wallet extension deterministically derived bearer
-// preimages off this same root too, under a 1' sub-purpose kept just for this
-// branch to avoid colliding with it; that extension is gone (see cash.go), so
-// there is nothing left to collide with.
-//
-// Bearer material for every note on the branch. Hand out CashNodeToCx1 of it,
-// never the node.
-func DeriveCashAddressNode(root CashNode, host string) (CashNode, error) {
-	return DeriveCashDomainNode(root, host)
-}
-
-// CashNodeToCx1 is the watch-only half of an address node: what a holder
-// hands a mint so the mint can pay to the holder's keys.
-func CashNodeToCx1(node CashNode) (Cx1, error) {
-	var out Cx1
-	var key secp256k1.ModNScalar
-	if key.SetBytes(&node.PrivateKey) != 0 || key.IsZero() {
-		return out, &ProtocolError{Detail: "cash node holds an invalid private key"}
-	}
-	copy(out.PubkeyXOnly[:], secp256k1.NewPrivateKey(&key).PubKey().SerializeCompressed()[1:])
-	out.ChainCode = node.ChainCode
-	return out, nil
-}
-
 // ---- a branch rooted in a Nostr key ----
 //
 // Not part of LUD-25. A lightning address on a Nostr-native mint belongs to an
@@ -691,9 +890,9 @@ func CashNodeToCx1(node CashNode) (Cx1, error) {
 //
 //	seed = HMAC-SHA256(key = the identity's secret key, msg = "LNURLcash/nostr-seed")
 //
-// then the address path above from that seed, unchanged. heartwood-esp32
-// derives exactly this on the device and lnurlcash-kit exports it, and all
-// three are graded against conformance's nostr-seed.json. The identity key
+// then LUD-26's tree from that seed, unchanged. heartwood-esp32 derives
+// exactly this on the device and lnurlcash-kit exports it, and all three are
+// graded against conformance's nostr-seed.json. The identity key
 // rebuilds every note paid to the branch, so whoever can restore that key can
 // recover the notes, with or without the device that received them.
 
@@ -710,14 +909,13 @@ func DeriveNostrCashSeed(secretKey [32]byte) [32]byte {
 	return seed
 }
 
-// DeriveNostrAddressNode returns one mint's address branch for a Nostr
-// identity. Bearer material, like any address node: hand out CashNodeToCx1 of
-// it.
-func DeriveNostrAddressNode(secretKey [32]byte, host string) (CashNode, error) {
+// DeriveNostrServiceRoot returns one mint's LUD-26 root S for a Nostr
+// identity. Bearer material, like any SERVICE root: hand out a share's cx1.
+func DeriveNostrServiceRoot(secretKey [32]byte, domain string) (CashNode, error) {
 	seed := DeriveNostrCashSeed(secretKey)
 	root, err := DeriveCashRoot(seed[:])
 	if err != nil {
 		return CashNode{}, err
 	}
-	return DeriveCashAddressNode(root, host)
+	return DeriveServiceRoot(root, domain)
 }

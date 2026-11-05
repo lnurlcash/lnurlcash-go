@@ -66,11 +66,15 @@ var (
 	ErrNotePending = errors.New("this note has another operation in progress - try again in a moment")
 )
 
-// ErrOutputInUse is LUD-25's {"status":"ERROR","reason":"already in use"}
-// case: an output this request named, p1 or p2, is already outstanding or was
-// burned before, so the service refused rather than credit value into a note
-// somebody else may hold the spend for. Nothing was burned. Name a fresh
-// output - the next index, for a key derived from a branch - and try again.
+// ErrOutputInUse is the refusal for an output this request named, p1 or p2,
+// that is already outstanding or was burned before: the service refused rather
+// than credit value into a note somebody else may hold the spend for. Nothing
+// was burned. Name a fresh output and try again.
+//
+// LUD-25's exact {"status":"ERROR","reason":"already in use"} is not this at a
+// callback or an informational GET: it also answers a spend of a burned note,
+// so classifyNoteError reads it as Spent (see IsAlreadyInUse). This matches
+// lnurl-mint's older "Output already in use.", which names the output.
 var ErrOutputInUse = errors.New("an output this request named is already in use - name a fresh one")
 
 // ProtocolError is a non-mutating response that does not match the protocol.
@@ -95,9 +99,10 @@ type ServiceError struct {
 	// Unknown is true when the service does not recognise the k1 at all.
 	// Distinct from Spent: nothing here proves the holder's copy was ever real.
 	Unknown bool
-	// OutputInUse is true for LUD-25's "already in use": an output the
-	// request named is taken, and nothing was burned. errors.Is(err,
-	// ErrOutputInUse) says the same.
+	// OutputInUse is true for lnurl-mint's "Output already in use.": an output
+	// the request named is taken, and nothing was burned. errors.Is(err,
+	// ErrOutputInUse) says the same. LUD-25's exact "already in use" is Spent
+	// instead; IsAlreadyInUse matches either.
 	OutputInUse bool
 	// NewSecrets are the fresh wallet-generated secrets a MUTATION disclosed
 	// the hashes of, when this refusal is one that could describe a mutation
@@ -215,6 +220,14 @@ func NewSecrets(err error) []string {
 	return nil
 }
 
+// IsAlreadyInUse reports whether the service answered "already in use"
+// (LUD-25) in any form: either a note being spent was burned, or an output is
+// somebody's already. A LUD-26 recovery scan counts it as a used index.
+func IsAlreadyInUse(err error) bool {
+	var service *ServiceError
+	return errors.As(err, &service) && strings.Contains(strings.ToLower(service.Reason), "already in use")
+}
+
 // IsSpent reports whether the service was authoritative that the note is gone.
 func IsSpent(err error) bool {
 	var service *ServiceError
@@ -234,13 +247,25 @@ func IsUnknownNote(err error) bool {
 // spent." from "Unknown note.", while the mutating callback - an atomic,
 // possibly multi-k1 request - can only say something like "Invalid or already
 // spent k1.", since it cannot tell which case applies to which k1.
+//
+// LUD-25 fixes one wording (luds 92abbb3): a burned note is answered exactly
+// "already in use", at the informational GET and at the callback alike, and a
+// LUD-26 recovery scan counts that as a used index. Every caller of this is
+// asking about a note being spent, so that exact reason is Spent. The same
+// reason also refuses a p1 or p2 that is already somebody's note, and from the
+// wording alone the two are one: a caller that named its own outputs and needs
+// to know which it was looks its inputs up. This package's own rotate, split
+// and merge mint to fresh secrets, which nobody else holds, so for them it is
+// the spent input. lnurl-mint's older "Output already in use." names the
+// output, and stays a refusal ErrOutputInUse matches.
 func classifyNoteError(reason string) error {
 	lowered := strings.ToLower(reason)
 	if lowered == "pending" {
 		return ErrNotePending
 	}
-	// LUD-25 says exactly "already in use"; lnurl-mint says "Output already
-	// in use.", so it is matched as a phrase, as lnurl-wallet does
+	if strings.TrimSpace(lowered) == "already in use" {
+		return &ServiceError{Reason: reason, Spent: true}
+	}
 	if strings.Contains(lowered, "already in use") {
 		return &ServiceError{Reason: reason, OutputInUse: true}
 	}
