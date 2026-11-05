@@ -3,6 +3,127 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
+## Unreleased
+
+**Breaking**, for wallets as much as for code. Follows LUD-26 as split out of
+LUD-25 (lnurl/luds `b62b8bf` and `a6c4652`, both marked BREAKING, through
+`92e430f`), matching `lnurlcash-core` 0.3.0 and 0.3.1, and grades against
+`lnurlcash-conformance` 0.16.2. CI's conformance checkout moves to `v0.16.2`.
+
+### What breaks for people's wallets
+
+- **Every seed-derived key-path note gets a new key.** A wallet on this
+  version that only scans the LUD-26 tree finds none of the notes it minted
+  under 0.2.x. Before or while upgrading, scan the old tree with the
+  `Legacy*` functions below and rotate every note found into a LUD-26 key.
+  Until then the notes are safe, just invisible to the new scan.
+- **Every registered Lightning Address stops working.** Its `cx1` is the old
+  64-byte shape, which LUD-26 mints no longer decode, and the old proof key
+  (purpose 0, index 0) is no share's key. Register a share's `cx1` again;
+  how a mint carries over the usernames it held is the mint's call.
+- **Certificates issued before luds `92abbb3`** sign no domain. They still
+  verify, reported `CertifiedOverLegacyQ`; a mint should re-issue `c` on the
+  next informational GET.
+- **Hosts with a port** (`localhost:3338`) now derive from the bare hostname,
+  so a development wallet against one sees a different tree again.
+- **LUD-25's exact `already in use` is now a spent note**, as luds `92abbb3`
+  words it for a burned note at the informational GET and the callback alike.
+  `classifyNoteError` used to read it as an output refusal, so a caller
+  matching `errors.Is(err, ErrOutputInUse)` for it no longer matches. It
+  reads as `IsSpent`, so a refused mutation carries its fresh secrets as any
+  spent refusal does. lnurl-mint's older `Output already in use.` stays
+  `ErrOutputInUse`. The same reason also refuses an output that is already
+  somebody's note, and the wording alone cannot tell the two apart: this
+  package's rotate, split and merge mint to fresh secrets, so for them it is
+  the spent input; a caller that named its own outputs looks its inputs up.
+  `IsAlreadyInUse(err)` matches the reason in either reading.
+
+### Derivation is plain BIP-32 (LUD-26)
+
+- `DeriveServiceRoot(root, domain)`: `S = m/139'/d1/d2/d3/d4`, the domain
+  reduced to its lowercase hostname without port first, the string every
+  signature at that mint commits to.
+- `NotePath` (`WalletNotePath`, `ChangeNotePath`, `ShareNotePath`) and
+  `DeriveNoteKey(S, path)` returning `NoteKey{SecretKey, Pubkey, OutputKey}`:
+  wallet notes `S/a'/0/i`, change `S/a'/1/i`, share notes `S/a'/2/n'/i`.
+  Accounts and shares are hardened, a note index must be below 2^31.
+  `ChainWallet`, `ChainChange`, `ChainShare`.
+- `DeriveShareNode(S, account, share)`, and `CashNodeToCx1` of it.
+- `Cx1` is now `{ChainCode, Pubkey}` with a 33-byte compressed key, BIP-32's
+  order, encoded as 65 bytes (113 characters). `EncodeCx1` takes a `Cx1`
+  rather than two keys, and `DecodeCx1` refuses a key that is not a
+  compressed point and the old 64-byte shape. `Cx1.PubkeyXOnly()` is what
+  proofs verify against.
+- `DeriveNotePubkey(cx1, index)` returns `Q` by BIP-32 CKDpub, what a mint
+  credits a registered share with. `DeriveCashChildPub` and
+  `CashNodePublicKey` are the primitives, checked against BIP-32's own
+  vector 1.
+- `DeriveNostrServiceRoot(secretKey, domain)` replaces
+  `DeriveNostrAddressNode`: the same LUD-26 tree from the Nostr seed.
+- Removed: `NotePurposeWallet`, `NotePurposeChange`,
+  `NotePurposeLightningAddress`, `DeriveNoteSecretKey`, the four-argument
+  `DeriveNotePubkey`, `DeriveCashAddressNode` and `DeriveNostrAddressNode`.
+
+### The old tweak, read only
+
+`LegacyBranchNode(root, host)` (the host as stored, port included),
+`LegacyCx1Of`, `LegacyCx1`, `EncodeLegacyCx1`/`DecodeLegacyCx1`,
+`LegacyDeriveNotePubkey(cx1, purpose, index)` and
+`LegacyDeriveNoteSecretKey(node, purpose, index)`, with `purpose` one of
+`LegacyPurposeWallet`, `LegacyPurposeChange`, `LegacyPurposeLightningAddress`,
+or `LegacyPurposeNone` for the scheme before purposes (luds `6e865b1`), which
+0.2.0 could no longer derive. For finding and sweeping notes only.
+
+### Registration proofs
+
+Signed by the share's own key and bound to the `cx1`:
+`AddressProofMessage`, `AddressProofDigest` and `SignAddressProof` take a
+`cx1` (empty for `unregister`) and an `update` action:
+
+- `register`: `LNURLcash:register:<domain>:<username>:<cx1>`
+- `update`: `LNURLcash:update:<domain>:<username>:<new cx1>`, by the key on
+  file; a PUT also carries a `register` proof by the new share
+- `unregister`: `LNURLcash:unregister:<domain>:<username>`, no `cx1`
+
+The username is lowercased. New `VerifyAddressProof(signer, signature, ...)`
+is the SERVICE's check, against `x(P)` of the signer's `cx1`.
+
+### Certificates bind the domain
+
+- `NoteSignatureMessage(k1, domain, amount)`,
+  `NoteSignatureMessageForHash(id, domain, amount)` and their digests sign
+  `LNURLcash:<domain>:<amount_msat>:<hex(Q)>`, and return an error for a domain
+  that names none. `LegacyNoteSignatureMessageForHash` and
+  `LegacyNoteSignatureDigestForHash` build the old message.
+- New `VerifyNoteCertificate(id, domain, amount, cs1, mintPubkey)` checks a
+  current certificate only: an amount-bearing `cs1` stating the amount it
+  signs, recovery id last. New `VerifyLegacyNoteSignatureHash` checks the old
+  message, in either recovery-id layout and from raw hex too.
+- `VerifyNoteSignatureHash` and `VerifyNoteSignatureForKey` take the domain.
+  They and `VerifyNoteSignature` fall back to the old messages:
+  `CertifiedOverLegacyQ` is new, beside `CertifiedOverHash`.
+- `DecodeCs1WithAmount` refuses a recovery id above 3.
+
+### Fees and internal transfers
+
+- `MintFee.AddressFeeMsat` (with `HasAddressFee`): LUD-26's third `Mint fees`
+  value. The token is now found anywhere in the `text/plain` entry and its
+  values end at whitespace: `Mint fees: 1000 , 2000` no longer parses, and
+  `Mint fees: 0,0,21000` is an address fee alone. Values above 2^53 are not
+  read.
+- `InternalTransferRequest(payRequest, noteDomain, k1, amountMsat)` and
+  `ParseInternalTransfer`: a whole note sent to a Lightning Address's callback
+  at the note's own mint. Refused before anything is sent unless the
+  address's `withdrawLink` is on the note's domain.
+
+### Tests
+
+The conformance vectors are graded in new `lud26_vectors_test.go`: part2.json
+and nostr-seed.json (every account's wallet, change and share notes, `cx1`s,
+`ck1`s, registration proofs and certificates), the legacy tweak cases, and
+spec-vectors.json's `lud25` and `lud26` (both BIP-32 test seeds), whose shape
+changed: `vector1` to `vector5` became `lud25` and `lud26`.
+
 ## 0.2.0 - 2026-09-29
 
 **Breaking.** All four changes below alter public signatures or derived

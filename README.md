@@ -179,37 +179,74 @@ about 2.1e21. It is computed split.
 
 ## Seed derivation
 
-LUD-25 derives a wallet's per-mint branch from its seed, and this package
-implements the specified path:
+LUD-26 derives a wallet's keys with plain BIP-32. Each mint gets its own root
+`S`, found with LUD-05's domain-hashing steps under this package's own purpose:
 
 ```
 cashHashingKey   = m/139'/0
-(d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, host)[0..16] as 4 uint32
-domainNode       = m/139'/d1/d2/d3/d4
+(d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, domain)[0..16] as 4 uint32
+S                = m/139'/d1/d2/d3/d4
 ```
 
-`d1..d4` are used **exactly as they fall**. BIP-32 reads any index `>= 2^31`
-as hardened, so which of the four levels are hardened is decided by the mint's
-own host name. Masking the top bit, or hardening all four, derives a different
-tree and restores nothing, silently.
+`domain` is the mint's lowercase hostname, never its scheme or port: a
+development mint at `localhost:3338` derives from `localhost`. `d1..d4` are
+used **exactly as they fall**. BIP-32 reads any index `>= 2^31` as hardened,
+so which of the four levels are hardened is decided by the mint's own host
+name. Masking the top bit, or hardening all four, derives a different tree and
+restores nothing, silently.
 
 ```go
-root, err := lnurlcash.DeriveCashRoot(seed)               // m/139'
-node, err := lnurlcash.DeriveCashDomainNode(root, host)   // m/139'/d1/d2/d3/d4
+root, err := lnurlcash.DeriveCashRoot(seed)                    // m/139'
+s, err := lnurlcash.DeriveServiceRoot(root, "mint.example")    // S, from a URL or a bare host
 ```
 
-That domain node is the address branch of key-path notes, below. Bearer
-preimages are not derived from the seed at all: LUD-25 has the wallet draw
-them as plain randomness, which is what `GenerateNoteSecret` does, and a
-bearer note must be backed up by other means or rotated into a key. An earlier
-deterministic ladder of preimages beneath this node (`DeriveCashSecret`,
-`CashSecretAt`, `CashSecretSource`) was never part of the spec and is gone.
+Below `S`, keys follow BIP-44's `account'/chain/index` layout, with a third
+chain for keys that may be shared:
+
+```
+S/a'/0/i       wallet: every note the wallet mints, rotates or merges into, a split's p1
+S/a'/1/i       change: a split's p2
+S/a'/2/n'      share n, exported as its cx1
+S/a'/2/n'/i    note i of share n, credited by the mint
+```
+
+```go
+key, _ := lnurlcash.DeriveNoteKey(s, lnurlcash.WalletNotePath(0, i))  // SecretKey, Pubkey (33), OutputKey (Q)
+share, _ := lnurlcash.DeriveShareNode(s, 0, n)                        // S/0'/2/n'
+xpub, _ := lnurlcash.CashNodeToCx1(share)
+cx1 := lnurlcash.EncodeCx1(xpub)                                      // the watch-only export
+```
+
+Accounts and shares are hardened and a note index must be below `2^31`;
+`DeriveNoteKey` refuses anything else. `DeriveCashChildPub` and
+`CashNodePublicKey` are the BIP-32 primitives underneath.
+
+Bearer preimages are not derived from the seed at all: LUD-25 has the wallet
+draw them as plain randomness, which is what `GenerateNoteSecret` does, and a
+bearer note must be backed up by other means or rotated into a key.
 
 `DeriveNoteRoot` / `DeriveNoteSecret` are the pre-spec HMAC scheme this
 project shipped before the draft had one. Not deprecated, because notes minted
 under it are still money; just not what to mint under. `BuildNoteInfoURLByHash`
 is the private lookup a restore walk over them should use; asking by secret
 publishes the very secrets it is looking for.
+
+### Upgrading from 0.2.x
+
+0.2.x derived note keys by tweaking one branch node, with a purpose counter.
+Those keys are not LUD-26's, so a wallet that only scans the LUD-26 tree finds
+none of the notes it minted before. Scan the old tree too, read-only, and
+rotate what is found into a LUD-26 key:
+
+```go
+node, _ := lnurlcash.LegacyBranchNode(root, host)   // host as stored, port included
+cx1, _ := lnurlcash.LegacyCx1Of(node)
+pk, _ := lnurlcash.LegacyDeriveNotePubkey(cx1, lnurlcash.LegacyPurposeWallet, i)
+sk, _ := lnurlcash.LegacyDeriveNoteSecretKey(node, lnurlcash.LegacyPurposeWallet, i)
+```
+
+`LegacyPurposeNone` is the scheme before purposes existed. Nothing new is ever
+derived or registered this way.
 
 ## Notes, spends and certificates
 
@@ -237,24 +274,18 @@ domain, which every call takes as a URL or a bare host and reduces to the
 lowercase hostname (`SpendDomainOf`):
 
 ```go
-root, _ := lnurlcash.DeriveCashRoot(seed)
-node, _ := lnurlcash.DeriveCashAddressNode(root, "mint.example") // m/139'/d1/d2/d3/d4
-cx, _ := lnurlcash.CashNodeToCx1(node)
-cx1 := lnurlcash.EncodeCx1(cx.PubkeyXOnly, cx.ChainCode)          // watch-only
-
-pk, _ := lnurlcash.DeriveNotePubkey(cx.PubkeyXOnly, cx.ChainCode, lnurlcash.NotePurposeWallet, i) // Q, used as is
-sk, _ := lnurlcash.DeriveNoteSecretKey(node.PrivateKey, node.ChainCode, lnurlcash.NotePurposeWallet, i)
-payload, _ := lnurlcash.SignNoteOwnership(sk, "mint.example")        // Q || sig, 96 bytes
-ck1 := lnurlcash.EncodeCk1(payload)                                   // spends at mint.example only
+key, _ := lnurlcash.DeriveNoteKey(s, lnurlcash.WalletNotePath(0, i))
+payload, _ := lnurlcash.SignNoteOwnership(key.SecretKey, "mint.example")  // Q || sig, 96 bytes
+ck1 := lnurlcash.EncodeCk1(payload)                                        // spends at mint.example only
 ```
 
-The purpose splits a branch into three independent counters, so a wallet's own
-indices and a service's auto-minted ones never collide, and each kind of note
-can be restored on its own: `NotePurposeWallet` (0) for every note the wallet
-mints, rotates or merges into, a split's `p1`, and the index-0 key that proves
-an address registration; `NotePurposeChange` (1) for a split's change `p2`;
-`NotePurposeLightningAddress` (2) for notes credited by Lightning Address
-auto-mint or an internal transfer. `i` counts per purpose, per service.
+A share's `cx1` is its extended public key, `bech32m("cx", chainCode || P)`:
+65 bytes, 113 characters, with `P` compressed so its parity is kept. `Cx1` is
+`{ChainCode, Pubkey}`, and `PubkeyXOnly()` is the `x(P)` a registration proof
+verifies against. A mint holding one derives the share's notes with CKDpub
+alone, `DeriveNotePubkey(cx1, i)`, and cannot spend any of them. The 64-byte
+`x(P) || chainCode` shape of 0.2.x is `DecodeLegacyCx1`'s; `DecodeCx1` refuses
+it, as LUD-26 mints do.
 
 Certificates travel as `c` (`c2` for a split's change), and a certified note
 URL as `&c=<cs1>`. The earlier `sig`, `sig2` and `&sig=` are still read, never
@@ -279,8 +310,10 @@ reported as `Unevaluated`. The mint judges its witness, and its time claim
 against its own clock (`CheckTimeClaim` predicts the answer).
 
 A certificate, `cs1…`, carries the amount in its prefix by BOLT 11 amount
-rules and signs `LNURLcash:<amount_msat>:<hex(Q)>`. A recipient checks a note
-offline from its URL alone:
+rules and signs `LNURLcash:<domain>:<amount_msat>:<hex(Q)>`, so it vouches for
+a note at the one mint on that domain and nowhere else. The amount in the
+prefix must be the one signed, and the recovery id (0 to 3) comes last. A
+recipient checks a note offline from its URL alone:
 
 ```go
 amount, certified := lnurlcash.VerifyNoteURL(noteURL, mintPubkey)
@@ -289,12 +322,19 @@ certified = lnurlcash.VerifyNoteSignature(k1, noteURL, amountMsat, cs1, mintPubk
 ```
 
 `VerifyNoteSignature` returns a `Certification`: `CertifiedOverQ`, as LUD-25
-specifies; `CertifiedOverHash` for a bearer note certified over its `h` by a
-mint from before notes were keyed by `Q`; or `NotCertified`. It checks that
-`k1` opens its note at the URL's domain first. `VerifyNoteSignatureHash`
-takes a bearer note's `h` instead, and `VerifyNoteSignatureForKey` a `hex(Q)`,
-for a watcher that holds no spend. A certificate proves issuance, not that the
-note is still outstanding: rotate a received note once online.
+specifies; `CertifiedOverLegacyQ` for a certificate over `hex(Q)` with no
+domain, as mints signed before luds `92abbb3`, which proves issuance but not
+at which of the key's mints (a mint should re-issue `c` on the next
+informational GET); `CertifiedOverHash` for a bearer note certified over its
+`h` by a mint from before notes were keyed by `Q`; or `NotCertified`. It
+checks that `k1` opens its note at the URL's domain first.
+`VerifyNoteSignatureHash` takes a bearer note's `h` instead, and
+`VerifyNoteSignatureForKey` a `hex(Q)`, for a watcher that holds no spend; both
+take the domain. `VerifyNoteCertificate` is the strict primitive under them,
+the current message only, and `VerifyLegacyNoteSignatureHash` reads the old
+messages, from raw hex too and in either recovery-id layout. A certificate
+proves issuance, not that the note is still outstanding: rotate a received
+note once online.
 
 `EncodeCs1WithAmount`, `DecodeCs1WithAmount` and `IsCs1WithAmount` are the
 current wire API; the fixed-prefix `EncodeCs1`, `DecodeCs1` and `IsCs1` remain
@@ -306,27 +346,54 @@ and as the comment on a mint invoice (a bearer `h` also as `h`, for mints that
 took that parameter first). A `cp1` whose key is not a curve point is refused
 before anything is sent.
 
-Reference-mint address management proves control with the address branch's
-index-0 key. `SignAddressProof(sk0, action, domain, username)` returns the raw
-64-byte BIP-340 proof over `sha256("LNURLcash:<action>:<domain>:<username>")`;
-action is `register` or `unregister`, the domain is the mint's own, and the
-username must be normalised exactly as it is sent to the service.
+A share registers a Lightning Address by signing with its own key, the private
+key at `S/a'/2/n'` (`DeriveShareNode`). The proof is a raw 64-byte BIP-340
+signature over `sha256` of one of:
 
-About the address branch:
+```
+register    LNURLcash:register:<domain>:<username>:<cx1>
+update      LNURLcash:update:<domain>:<username>:<new cx1>
+unregister  LNURLcash:unregister:<domain>:<username>
+```
 
-- **The branch is the spec's literal path.** `m/139'/d1/d2/d3/d4`, hashing
-  key at `m/139'/0`: the same node `DeriveCashDomainNode` returns. Notes
-  received under the earlier `m/139'/1'` hop are not on it.
-- **A `cx1` links every note on its branch.** It spends nothing, but whoever
-  holds it can list every key on the branch. Receive on it, then rotate off.
-- **`i` is any uint32**, four bytes big-endian, never hardened.
+`SignAddressProof(shareKey, action, domain, username, cx1)` signs it, with
+`cx1` empty for `unregister`, and `VerifyAddressProof(signer, sig, ...)` is the
+mint's check against `x(P)` of the signer's `cx1`. The domain stops a proof one
+mint has seen from being replayed at another, and the `cx1` stops it being
+replayed with another chain code or parity byte around the same `x(P)`. The
+username is lowercased. A PUT carries two: `update` by the key on file and
+`register` by the new share.
 
-`DeriveNostrAddressNode(secretKey, host)` roots the same branch in a Nostr
+A whole note can be paid to a Lightning Address at the note's own mint without
+Lightning: `InternalTransferRequest(payRequest, noteDomain, k1, amountMsat)`
+builds the callback request and `ParseInternalTransfer` reads the answer.
+`amountMsat` must be the note's full value, and the request is refused before
+anything is sent unless the address's `withdrawLink` is on the note's domain.
+
+A mint advertises LUD-26's address fee as the third value of `Mint fees`:
+`Mint fees: <base_fee_msat>,<fee_ppm>,<address_fee_msat>`, read into
+`MintFee.AddressFeeMsat` (with `HasAddressFee`). The token may sit anywhere in
+the `text/plain` entry and its values end at whitespace, so `Mint fees: 0,0,21000`
+is an address fee alone and `Mint fees: 1000 , 2000` is no fee.
+
+About the key-path tree:
+
+- **`S` is per domain.** Seed plus domain recovers everything the wallet holds
+  at that mint. Notes received under the earlier `m/139'/1'` hop are not on it.
+- **A `cx1` links every note on its share.** It spends nothing, but whoever
+  holds it can list every key on the share. Use a fresh share for each party,
+  receive on it, then rotate off.
+- **Note indices are not hardened**, so a leaked `sk_i` of a share, with its
+  `cx1`, exposes every other note still on that share. Other shares and the
+  wallet and change chains are unaffected.
+
+`DeriveNostrServiceRoot(secretKey, domain)` roots the same tree in a Nostr
 identity key instead of a seed phrase: `HMAC-SHA256(key, "LNURLcash/nostr-seed")`,
-then the path above. That is ours, not LUD-25's, and heartwood-esp32 derives
-the same branch on the device. Both are graded against conformance's
+then `S` as above. That is ours, not LUD-25's or LUD-26's, and heartwood-esp32
+derives the same tree on the device. Both are graded against conformance's
 `part2.json` and `nostr-seed.json`, every field, and the spends against
-`spends.json` and LUD-25's own published vectors (`spec-vectors.json`).
+`spends.json` and LUD-25's and LUD-26's own published vectors
+(`spec-vectors.json`).
 
 ## Amounts
 

@@ -79,17 +79,22 @@ client.RotateNoteWithHash / SplitNoteWithHash / MergeNotesWithHash (Mutation)
   the caller names each output (a bearer h, or a cp1) - no NewSecrets on
   errors, so persist what the outputs belong to BEFORE calling
 
-DeriveCashRoot(seed) -> CashNode              LUD-25's scheme, BIP-32 m/139'
-DeriveCashDomainNode(root, host) -> CashNode  m/139'/d1/d2/d3/d4, d1..d4 =
-  HMAC-SHA256(privkey at m/139'/0, host)[0..16] as 4 RAW big-endian uint32.
-  RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
-  the host name. NEVER mask the top bit, NEVER harden all four - either
-  derives a different tree and restores nothing, silently.
-  The domain node IS the key-path notes' address branch. Bearer preimages are
-  plain randomness (GenerateNoteSecret), never seed-derived.
+DeriveCashRoot(seed) -> CashNode              BIP-32 m/139'
+DeriveServiceRoot(root, domain) -> CashNode   LUD-26's S = m/139'/d1/d2/d3/d4,
+  d1..d4 = HMAC-SHA256(privkey at m/139'/0, DOMAIN)[0..16] as 4 RAW big-endian
+  uint32. domain: a URL or bare host, reduced to the lowercase hostname, NO PORT
+  (localhost:3338 derives from localhost). RAW: BIP-32 reads >= 2^31 as
+  hardened, so ~half the levels are, decided by the host name. NEVER mask the
+  top bit, NEVER harden all four - either derives a different tree and
+  restores nothing, silently. Bearer preimages are plain randomness
+  (GenerateNoteSecret), never seed-derived.
+DeriveCashDomainNode(root, host) -> CashNode  the same walk over host AS STORED,
+  port included: the superseded tweak schemes' node (LegacyBranchNode)
 CashNodeToHex / CashNodeFromHex   privateKey || chainCode, 64 bytes
 DeriveCashChild(node, rawUint32)  BIP-32 CKDpriv, for checking this package
   against BIP-32's own vectors
+DeriveCashChildPub(P (33), chainCode, i) -> (child P, chain code)  BIP-32 CKDpub;
+  a hardened i is an error. CashNodePublicKey(node) -> [33]byte
 DeriveNoteRoot / DeriveNoteSecret  LEGACY pre-spec HMAC scheme. Do not mint
   under it; still scanned so old notes stay findable.
 BuildNoteInfoURLByHash(withdrawLink, h) + ParseNoteInfoByHash(body, policy)
@@ -123,23 +128,35 @@ CheckTimeClaim(locktime, sequence, now, lockedAt) - the mint's clock rules
 No script interpreter.
 
 Key-path notes (recoverable.go):
-DeriveCashAddressNode(root, host) -> CashNode  m/139'/d1/d2/d3/d4, hashing key
-  m/139'/0: the spec's literal path, the same node DeriveCashDomainNode returns
-CashNodeToCx1(node) -> Cx1{PubkeyXOnly, ChainCode}  watch-only; links the branch
-DeriveNotePubkey(branchX, chainCode, purpose, i) -> [32]byte  Q, used as is (no
-  BIP-86 tweak); watch-only; i any uint32. purpose: NotePurposeWallet (0, also
-  a split's p1 and the address proof key at index 0), NotePurposeChange (1, a
-  split's p2), NotePurposeLightningAddress (2, auto-mint and internal transfer)
-DeriveNoteSecretKey(branchKey, chainCode, purpose, i) -> [32]byte  negates an odd branch
-  key first. t = tagged_hash("LNURLcash/derive", P || cc || ser32_be(purpose) || ser32_be(i));
-  t is reduced mod n; a key at zero is an ERROR (use the next index)
+Below S (LUD-26), plain BIP-32; accounts and shares hardened, note index < 2^31:
+  S/a'/0/i wallet (every note the wallet mints, rotates or merges into, a
+  split's p1)   S/a'/1/i change (a split's p2)   S/a'/2/n' share n (its cx1)
+  S/a'/2/n'/i note i of share n, picked and credited by the mint
+NotePath: WalletNotePath(a, i) | ChangeNotePath(a, i) | ShareNotePath(a, n, i);
+  ChainWallet 0, ChainChange 1, ChainShare 2; .Indices() -> BIP-32 steps below S
+DeriveNoteKey(S, path) -> NoteKey{SecretKey, Pubkey (33, parity visible),
+  OutputKey (Q = x(Pubkey))}. Q is used as is (no BIP-86 tweak)
+DeriveShareNode(S, account, share) -> CashNode  S/a'/2/n'; sign its registration
+  with its own key
+CashNodeToCx1(shareNode) -> Cx1{ChainCode [32], Pubkey [33]}  watch-only xpub;
+  links every note on the share. Cx1.PubkeyXOnly() = x(P)
+DeriveNotePubkey(cx1, i) -> [32]byte  Q of note i on the share, by CKDpub from
+  the cx1 alone; hardened i is an error; an unusable index (~2^-127) is an
+  ERROR (use the next)
+LEGACY, read-only (the tweak before LUD-26; sweep and rotate, never mint):
+  LegacyBranchNode(root, hostAsStored), LegacyCx1Of(node) -> LegacyCx1{PubkeyXOnly,
+  ChainCode} (64-byte cx1: EncodeLegacyCx1 / DecodeLegacyCx1),
+  LegacyDeriveNotePubkey(cx1, purpose, i), LegacyDeriveNoteSecretKey(node, purpose, i);
+  purpose: LegacyPurposeWallet 0 | Change 1 | LightningAddress 2 | None (-1, before
+  purposes). t = tagged_hash("LNURLcash/derive", P || cc [|| ser32_be(purpose)] || ser32_be(i))
 SignNoteOwnership(sk, domain) -> [96]byte  Q || BIP-340 sig over
   KeyPathSighash(Q, domain), zero aux_rand: one deterministic ck1 per mint
 RecoverNoteOwnershipPubkey(payload, domain) -> NoteOwnership{PubkeyXOnly,
   Legacy}  verifies before returning: the domain's sighash, else the old
   fixed messages (Legacy); a 65-byte ECDSA payload is recovered (Legacy)
 EncodeCp1 / DecodeCp1 (32 bytes, MUST be a curve point), EncodeCk1 (96),
-  Cx1 (64), IsCp1/IsCk1/IsCx1
+  EncodeCx1(Cx1) / DecodeCx1: chainCode || P, 65 bytes, 113 chars; P must be a
+  compressed curve point; the old 64-byte shape is refused. IsCp1/IsCk1/IsCx1
 DecodeCk1 -> DecodedCk1{Current [96]byte, Legacy [65]byte, IsLegacy}; .Bytes()
   bech32m, NO 90-char limit, all-uppercase ok; mixed case, a bech32 checksum,
   a wrong hrp or length, or non-zero padding are refused. Never panic
@@ -150,21 +167,41 @@ EncodeCs1WithAmount / DecodeCs1WithAmount / IsCs1WithAmount
 Wire: a spend goes wherever a k1 does. An output (cp1 or bearer h) goes as
   p1/p2 on rotate/split/merge, p on a lookup, the comment on a mint invoice
   (a bearer h also as h). An off-curve cp1 is refused before sending.
-Certificates (signature.go), cs1 over "LNURLcash:<amount_msat>:<hex(Q)>":
+Certificates (signature.go), cs1 over "LNURLcash:<domain>:<amount_msat>:<hex(Q)>":
   VerifyNoteSignature(k1, domain, amountMsat, sig, mintPubkey) -> Certification
-    checks k1 opens Q at domain first; a bearer note falls back to its h
-  VerifyNoteSignatureHash(h, ...)       a bearer note by its h: Q, then h
-  VerifyNoteSignatureForKey(hexQ, ...)  a watcher with no spend
+    checks k1 opens Q at domain first; then the legacy messages. The cs1's own
+    prefix amount must equal amountMsat; recovery id last, 0 to 3
+  VerifyNoteSignatureHash(h, domain, ...)       a bearer note by its h
+  VerifyNoteSignatureForKey(hexQ, domain, ...)  a watcher with no spend
+  VerifyNoteCertificate(hexQ, domain, ...) bool the strict current-message primitive
+  VerifyLegacyNoteSignatureHash(id, amt, sig, pk) bool  the old messages: no
+    domain, over hex(Q) or a bearer h; raw hex and either recovery layout ok
   VerifyNoteURL(noteURL, mintPubkey) -> (amountMsat, Certification)
-  Certification: CertifiedOverQ | CertifiedOverHash (pre-taproot mint) |
-    NotCertified; .Verified()
-  NoteSignatureMessage(k1, amt), NoteSignatureMessageForHash(hexID, amt),
-    and the Digest pair: the message over a note's hex id
-DeriveNostrCashSeed(sk) / DeriveNostrAddressNode(sk, host)  EXTENSION, not
-  LUD-25: seed = HMAC-SHA256(sk, "LNURLcash/nostr-seed"), then the path above
-AddressProofMessage(action, domain, username) / AddressProofDigest(...)
-  / SignAddressProof(indexZeroSK, action, domain, username) -> [64]byte
-  raw BIP-340 over sha256("LNURLcash:<register|unregister>:<domain>:<username>")
+  Certification: CertifiedOverQ | CertifiedOverLegacyQ (hex(Q), no domain,
+    before luds 92abbb3) | CertifiedOverHash (pre-taproot mint) | NotCertified;
+    .Verified()
+  NoteSignatureMessage(k1, domain, amt), NoteSignatureMessageForHash(hexID,
+    domain, amt) and the Digest pair: the message over a note's hex id.
+    LegacyNoteSignatureMessageForHash(id, amt) / ...DigestForHash: the old one
+DeriveNostrCashSeed(sk) / DeriveNostrServiceRoot(sk, domain)  EXTENSION, not
+  LUD-25 or LUD-26: seed = HMAC-SHA256(sk, "LNURLcash/nostr-seed"), then S above
+AddressProofMessage(action, domain, username, cx1) / AddressProofDigest(...)
+  / SignAddressProof(shareSK, action, domain, username, cx1) -> [64]byte
+  / VerifyAddressProof(signerCx1, sig, action, domain, username, cx1) bool
+  raw BIP-340 by the share's own key (S/a'/2/n') over sha256 of
+    register   "LNURLcash:register:<domain>:<username>:<cx1>"
+    update     "LNURLcash:update:<domain>:<username>:<new cx1>"  (a PUT also
+               carries a register proof by the new share)
+    unregister "LNURLcash:unregister:<domain>:<username>"   (cx1 "")
+  username lowercased; cx1 in canonical lowercase. Verified against x(P) of the
+  cx1 being registered, or for update/unregister the one on file
+InternalTransferRequest(payRequest, noteDomain, k1, amountMsat) / ParseInternalTransfer(body)
+  pay a Lightning Address at the note's OWN mint with the note: refused unless
+  its withdrawLink is on noteDomain; amount = the note's full value
+MintFee{BaseFeeMsat, FeePpm, AddressFeeMsat, HasAddressFee}  "Mint fees: a,b[,c]"
+  anywhere in the text/plain entry, values end at whitespace; c = LUD-26 address fee
+IsAlreadyInUse(err): the reason "already in use", exact (a burned note: Spent) or
+  lnurl-mint's "Output already in use." (an output: ErrOutputInUse)
 
 Pure functions: VerifyNoteSignature, VerifySpend, GenerateNoteSecret, HashK1, IsPreimage,
 ResolveNoteInput, ResolveMintInput, ResolveLnurlInput, IsAllowedServiceURL,
@@ -189,9 +226,14 @@ Amounts are int64 milli-satoshis everywhere.
 
 errors.Is(err, ErrRequestRefused)  nothing sent, note untouched
 errors.Is(err, ErrNotePending)     a melt is in flight - retry, NOT spent
-IsSpent(err)                       authoritative: already burned
-errors.Is(err, ErrOutputInUse)     "already in use": a p1/p2 is taken. Nothing
-                                   burned; name a fresh output (next index)
+IsSpent(err)                       authoritative: already burned. LUD-25's exact
+                                   "already in use" is read as this (it also
+                                   answers a taken output; see IsAlreadyInUse)
+IsAlreadyInUse(err)                "already in use" in either reading: a burned
+                                   note or a taken p1/p2. A recovery scan counts
+                                   it as a used index
+errors.Is(err, ErrOutputInUse)     lnurl-mint's "Output already in use.": a p1/p2
+                                   is taken. Nothing burned; name a fresh output
 IsUnknownNote(err)                 service does not recognise it
 IsAmbiguous(err)                   outcome UNKNOWN - assume nothing
 IsUnverifiable(err)                the mutation LANDED, but a cp1 output came
