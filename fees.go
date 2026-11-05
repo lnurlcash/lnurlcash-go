@@ -3,27 +3,93 @@ package lnurlcash
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
-// MintFee is what a service withholds when minting (LUD-25, optional).
+// MintFee is what a service withholds when minting (LUD-25, optional), and
+// LUD-26's address fee.
 //
-// A service signals it via an extra ["text/plain", "Mint fees:
-// <base_fee_msat>,<fee_percent_ppm>"] entry in a payRequest's metadata, so a
-// wallet can warn the payer up front that the note they end up holding is worth
-// less than the invoice they paid. A service that omits the entry is fee-free,
-// not unknown.
+// A service signals it with a "Mint fees: <base_fee_msat>,<fee_ppm>" token
+// anywhere in its payRequest's text/plain metadata entry, so a wallet can warn
+// the payer up front that the note they end up holding is worth less than the
+// invoice they paid. The values are plain base-10 integers separated by commas,
+// ending at whitespace or the end of the entry. A third value is LUD-26's
+// address fee, what registering one Lightning Address costs. A service without
+// the token is fee-free, not unknown.
 type MintFee struct {
 	BaseFeeMsat int64
 	FeePpm      int64
+	// AddressFeeMsat is LUD-26's third value: the fee per Lightning Address
+	// registration. Valid only when HasAddressFee is true, which is false when
+	// it is not advertised or does not parse; either way a wallet should
+	// refuse to pay a registration invoice it was not told about.
+	AddressFeeMsat int64
+	HasAddressFee  bool
 }
 
-var mintFeeRe = regexp.MustCompile(`^Mint fees:\s*(\d+)\s*,\s*(\d+)\s*$`)
+const mintFeeToken = "Mint fees:"
 
-// ParseMintFee reads a fee out of payRequest metadata. Returns false when the
-// service advertised none, which the spec says to read as fee-free.
+// Above 2^53 most languages lose integer precision, and a fee read wrong is
+// worse than no fee: refuse it rather than estimate with a mangled value.
+const maxSafeInteger = 1<<53 - 1
+
+func feeValue(text string) (int64, bool) {
+	if text == "" {
+		return 0, false
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || value > maxSafeInteger {
+		return 0, false
+	}
+	return value, true
+}
+
+// parseFeeToken reads the token's values: after "Mint fees:" and any spaces, up
+// to the next whitespace. False when the first two do not parse, which LUD-25
+// calls an unknown fee: a wallet relies on maxWithdrawable alone.
+func parseFeeToken(text string) (MintFee, bool) {
+	at := strings.Index(text, mintFeeToken)
+	if at < 0 {
+		return MintFee{}, false
+	}
+	rest := strings.TrimLeftFunc(text[at+len(mintFeeToken):], unicode.IsSpace)
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		rest = rest[:end]
+	}
+	parts := strings.Split(rest, ",")
+	if len(parts) < 2 {
+		return MintFee{}, false
+	}
+	base, ok1 := feeValue(parts[0])
+	ppm, ok2 := feeValue(parts[1])
+	if !ok1 || !ok2 {
+		return MintFee{}, false
+	}
+	// A fee of 100% or more can never net anything. Refusing it here is also
+	// what keeps GrossUpForMintFee's search bounded, so a service cannot
+	// stall a caller simply by advertising one.
+	if ppm >= 1_000_000 {
+		return MintFee{}, false
+	}
+	fee := MintFee{BaseFeeMsat: base, FeePpm: ppm}
+	if len(parts) > 2 {
+		fee.AddressFeeMsat, fee.HasAddressFee = feeValue(parts[2])
+	}
+	return fee, true
+}
+
+// ParseMintFee reads the first parseable Mint fees token out of payRequest
+// metadata's text/plain entries. Returns false when there is none, which the
+// spec says to read as fee-free; when it does not parse, which is a fee the
+// wallet does not know; and when every value is zero, so a caller never has to
+// special-case a fee that withholds nothing.
 func ParseMintFee(metadata string) (MintFee, bool) {
 	var entries [][]json.RawMessage
 	if err := json.Unmarshal([]byte(metadata), &entries); err != nil {
@@ -40,28 +106,14 @@ func ParseMintFee(metadata string) (MintFee, bool) {
 		if json.Unmarshal(entry[1], &text) != nil {
 			continue
 		}
-		match := mintFeeRe.FindStringSubmatch(text)
-		if match == nil {
+		fee, ok := parseFeeToken(text)
+		if !ok {
 			continue
 		}
-		base, err1 := strconv.ParseInt(match[1], 10, 64)
-		ppm, err2 := strconv.ParseInt(match[2], 10, 64)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		// A fee of 100% or more can never net anything. Refusing it here is also
-		// what keeps GrossUpForMintFee's search bounded, so a service cannot
-		// stall a caller simply by advertising one.
-		if ppm >= 1_000_000 {
-			continue
-		}
-		// An explicit "Mint fees: 0,0" has exactly the effect of omitting the
-		// entry - treat it identically, so callers never have to special-case a
-		// fee that is present but withholds nothing.
-		if base == 0 && ppm == 0 {
+		if fee.BaseFeeMsat == 0 && fee.FeePpm == 0 && (!fee.HasAddressFee || fee.AddressFeeMsat == 0) {
 			return MintFee{}, false
 		}
-		return MintFee{BaseFeeMsat: base, FeePpm: ppm}, true
+		return fee, true
 	}
 	return MintFee{}, false
 }

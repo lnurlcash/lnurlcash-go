@@ -42,15 +42,16 @@ func loadPart2(t *testing.T) part2Sample {
 	t.Helper()
 	var vectors part2Vectors
 	loadVectorsStrict(t, "part2.json", &vectors)
-	notes := vectors.Branches[0].Notes
+	branch := vectors.Branches[0]
+	notes := branch.Accounts[0].Wallet
 	return part2Sample{
 		a:          notes[0],
 		b:          notes[1],
 		c:          notes[2],
-		domain:     vectors.Branches[0].Domain,
+		domain:     branch.Domain,
 		cs1:        vectors.Certificates[0].Cs1,
 		mintPubkey: vectors.Mint.MintPubkey,
-		cx1:        vectors.Branches[0].Cx1,
+		cx1:        branch.Accounts[0].Shares[0].Cx1,
 	}
 }
 
@@ -107,14 +108,17 @@ func TestNoteIDOfFilesEveryNoteByItsQ(t *testing.T) {
 	}
 }
 
-func TestTheSignedMessageNamesAPart2NoteByItsKey(t *testing.T) {
+func TestTheSignedMessageNamesAPart2NoteByItsKeyAndDomain(t *testing.T) {
 	part2 := loadPart2(t)
-	message, err := lnurlcash.NoteSignatureMessage(part2.a.Ck1, 21000)
-	if err != nil || message != "LNURLcash:21000:"+part2.a.NotePubkey {
+	message, err := lnurlcash.NoteSignatureMessage(part2.a.Ck1, "https://"+part2.domain+":8443/w", 21000)
+	if err != nil || message != "LNURLcash:"+part2.domain+":21000:"+part2.a.NotePubkey {
 		t.Errorf("message = %q (%v)", message, err)
 	}
-	if _, err := lnurlcash.NoteSignatureMessage("not a k1", 21000); err == nil {
+	if _, err := lnurlcash.NoteSignatureMessage("not a k1", part2.domain, 21000); err == nil {
 		t.Error("built a message over something that is not a k1")
+	}
+	if _, err := lnurlcash.NoteSignatureMessage(part2.a.Ck1, "", 21000); err == nil {
+		t.Error("built a message for no domain")
 	}
 }
 
@@ -455,17 +459,20 @@ func TestPart2RefusesWhatIsNotAKey(t *testing.T) {
 	order, _ := hex.DecodeString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
 	var n [32]byte
 	copy(n[:], order)
-	var beyondPrime [32]byte
-	for i := range beyondPrime {
-		beyondPrime[i] = 0xff
-	}
 
-	if _, err := lnurlcash.DeriveNotePubkey(beyondPrime, chainCode, lnurlcash.NotePurposeWallet, 0); err == nil {
-		t.Error("derived from a branch key that is no point's x")
+	// 04 is not a compressed point's prefix, an x above the field prime is no
+	// point, and an empty key is neither
+	for _, pubkey := range [][33]byte{{0x04}, {0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, {}} {
+		if _, err := lnurlcash.DeriveNotePubkey(lnurlcash.Cx1{ChainCode: chainCode, Pubkey: pubkey}, 0); err == nil {
+			t.Errorf("derived from the share key %x", pubkey)
+		}
 	}
 	for _, key := range [][32]byte{zero, n} {
-		if _, err := lnurlcash.DeriveNoteSecretKey(key, chainCode, lnurlcash.NotePurposeWallet, 0); err == nil {
-			t.Errorf("derived from branch key %x", key)
+		if _, err := lnurlcash.DeriveNoteKey(lnurlcash.CashNode{PrivateKey: key}, lnurlcash.WalletNotePath(0, 0)); err == nil {
+			t.Errorf("derived from service root key %x", key)
+		}
+		if _, err := lnurlcash.LegacyDeriveNoteSecretKey(lnurlcash.CashNode{PrivateKey: key}, lnurlcash.LegacyPurposeWallet, 0); err == nil {
+			t.Errorf("derived a legacy note from branch key %x", key)
 		}
 		if _, err := lnurlcash.SignNoteOwnership(key, part2.domain); err == nil {
 			t.Errorf("signed with %x", key)
@@ -535,7 +542,8 @@ func TestAmountBearingCs1Boundaries(t *testing.T) {
 
 // Padding is the one malleability bech32m leaves to the decoder: bits after
 // the payload that the checksum covers but the bytes do not. Refusing any that
-// are not zero leaves each payload exactly one encoding.
+// are not zero leaves each payload exactly one encoding. A cx1 is 65 bytes,
+// which fill 104 words exactly, so it has no padding to refuse.
 func TestRefusesNonZeroPadding(t *testing.T) {
 	part2 := loadPart2(t)
 	for _, c := range []struct {
@@ -545,7 +553,6 @@ func TestRefusesNonZeroPadding(t *testing.T) {
 	}{
 		{"cp", part2.a.Cp1, func(v string) error { _, err := lnurlcash.DecodeCp1(v); return err }},
 		{"ck", part2.a.Ck1, func(v string) error { _, err := lnurlcash.DecodeCk1(v); return err }},
-		{"cx", part2.cx1, func(v string) error { _, err := lnurlcash.DecodeCx1(v); return err }},
 		{"cw", mustBearerCw1(t), func(v string) error { _, err := lnurlcash.DecodeCw1(v); return err }},
 	} {
 		_, words, err := bech32.DecodeNoLimit(c.value)
@@ -800,8 +807,12 @@ func FuzzPart2Decoders(f *testing.F) {
 	var vectors part2Vectors
 	if raw, err := os.ReadFile(filepath.Join(vectorsDir(f), "part2.json")); err == nil && json.Unmarshal(raw, &vectors) == nil {
 		for _, branch := range vectors.Branches {
-			f.Add(branch.Cx1)
-			for _, note := range branch.Notes {
+			for _, account := range branch.Accounts {
+				for _, share := range account.Shares {
+					f.Add(share.Cx1)
+				}
+			}
+			for _, note := range allNotes(branch.Accounts) {
 				f.Add(note.Cp1)
 				f.Add(note.Ck1)
 			}
@@ -831,7 +842,7 @@ func FuzzPart2Decoders(f *testing.F) {
 				t.Errorf("amount-bearing cs1 %q encodes differently (%v)", value, encodeErr)
 			}
 		}
-		if branch, err := lnurlcash.DecodeCx1(value); err == nil && lnurlcash.EncodeCx1(branch.PubkeyXOnly, branch.ChainCode) != canonical {
+		if branch, err := lnurlcash.DecodeCx1(value); err == nil && lnurlcash.EncodeCx1(branch) != canonical {
 			t.Errorf("cx1 %q decodes to %+v, which encodes differently", value, branch)
 		}
 		if spend, err := lnurlcash.DecodeCw1(value); err == nil {

@@ -18,8 +18,11 @@ any mint that holds its note; a `ck1` only at the mint whose domain it
 signed. Compromise is theft, and it is silent and irreversible: the money is
 gone before the previous holder has any way to notice.
 
-**Note keys and address branches.** A note key signs its `ck1`, so it is the
-note. An address node derives every note key on its branch.
+**Note keys, service roots and share nodes.** A note key signs its `ck1`, so
+it is the note. A service root `S` derives every note key the wallet will ever
+hold at that mint; a share node derives every note on its share. Hand a mint a
+share's `cx1`, never a node. A `cx1` is an extended public key, so it spends
+nothing but links every note on its share.
 
 **Replacement secrets awaiting confirmation.** After a mutation whose outcome
 is unknown, the secrets generated in-process may be the only copies of notes
@@ -58,8 +61,12 @@ canonical transaction whose prevout is `tagged_hash("LNURLcash/mint",
 domain)`, so a signature one mint has seen verifies nowhere else.
 `SignNoteOwnership` takes the domain from whatever URL or host it is given
 and keeps only the lowercase hostname, so a scheme, a port or a case
-difference cannot silently sign for a mint that does not exist. A register
-or unregister proof binds the domain the same way. A bearer note's spend
+difference cannot silently sign for a mint that does not exist. A register,
+update or unregister proof binds the domain the same way, and the `cx1` it
+puts on file, so a proof captured by one mint cannot be replayed at another,
+or with another chain code or parity byte around the same `x(P)`. The
+certificate (`cs1`) binds the domain too, so it vouches for a note at one mint
+only. A bearer note's spend
 signs nothing and is bound to no mint: it spends its note wherever the note
 exists, exactly as a plain `k1` always has.
 
@@ -93,11 +100,13 @@ would otherwise mint a self-contained fake note that verifies against
 nothing.
 
 **A service that inflates a note.** A certificate (`cs1`) commits to the
-amount and to the note's `hex(Q)`, for every note, a bearer note included. A
-service reporting more than it signed fails verification, without the holder
-contacting anyone. A certificate over a bearer note's `h`, the message mints
-used before notes were keyed by `Q`, is still read and reported as
-`CertifiedOverHash`, so a caller can tell a mint that has not caught up.
+domain, the amount and the note's `hex(Q)`, for every note, a bearer note
+included, and its prefix must state the amount it signs. A service reporting
+more than it signed fails verification, without the holder contacting anyone.
+Two older messages are still read, so notes people hold keep verifying, and are
+reported as such so a caller can tell a mint that has not caught up:
+`CertifiedOverLegacyQ`, `hex(Q)` with no domain (before luds `92abbb3`), and
+`CertifiedOverHash`, a bearer note's `h` (before notes were keyed by `Q`).
 
 **A service that swaps your note.** The informational GET checks that the
 echoed `k1` is the one queried, or another spend that opens the same `Q` at
@@ -108,8 +117,16 @@ redeemed by somebody else.
 informational GET, since the service already knows what it signed.
 
 **A hostile fee advertisement.** Fees of 100% or more are refused at parse
-time, and the gross-up search is a binary search rather than a walk — so a
-service cannot stall a caller with an extreme fee.
+time, values above 2^53 are not read, and the gross-up search is a binary
+search rather than a walk, so a service cannot stall a caller with an extreme
+fee. A registration invoice is the wallet's to compare with the advertised
+address fee (`MintFee.AddressFeeMsat`); one that was not advertised should be
+refused.
+
+**A note sent to the wrong mint.** `InternalTransferRequest` hands a spend to a
+Lightning Address's callback, so it is refused unless the address's
+`withdrawLink` is on the note's own domain: anywhere else it would give a
+bearer secret to a service that does not hold the note.
 
 **Integer overflow on realistic amounts.** The proportional fee term is
 computed split, because 21M BTC in msat times a high ppm exceeds 64-bit
@@ -156,6 +173,17 @@ no payment routing.
 the leaf rules only, and `VerifySpend` says so (`Unevaluated`);
 `VerifyNoteSignature` refuses to vouch for one. Only the mint, running
 consensus rules, decides whether its witness satisfies the leaf.
+
+**Shared note indices.** Note indices below a share are not hardened, as in
+BIP-44, so a leaked `sk_i` of a share together with its `cx1` exposes every
+other note still on that share. Other shares and the wallet and change chains
+are unaffected. Use a fresh share for each party and rotate received notes
+promptly.
+
+**Notes under the superseded tweak.** Keys derived before LUD-26 are not on
+the LUD-26 tree. The `Legacy*` functions only derive them for a sweep; nothing
+new is minted or registered that way, and a wallet that never scans them
+cannot see those notes.
 
 **Timelocks.** A timelock a mint honours is the mint asserting its own clock:
 a custodial policy, never a trustless guarantee. `CheckTimeClaim` only
